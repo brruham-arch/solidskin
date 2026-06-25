@@ -352,7 +352,8 @@ static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
 // supaya rendering frame berikutnya tidak terganggu.
 
 static inline void set_uniform_color(const float col[4]) {
-    // Tidak perlu cek g_we_overrode_color di sini
+    // Langsung set uniform tanpa cek g_we_overrode_color
+    // Dipanggil dari dalam two-pass, loc sudah pasti resolved (bukan -2)
     if (g_materialDiffuse_loc >= 0)
         orig_glUniform4fv(g_materialDiffuse_loc, 1, col);
     if (g_materialAmbient_loc >= 0)
@@ -413,17 +414,18 @@ static void two_pass_draw_arrays(GLenum mode, GLint first, GLsizei count) {
 
 // ─── Hook: glDrawElements / glDrawArrays ─────────────────────────────────────
 static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    // Jalankan two-pass kalau is_ped=1, TERLEPAS dari g_we_overrode_color
-    if (g_enabled && g_is_ped_program) {
+    // Cukup is_ped=1 untuk two-pass, tidak perlu tunggu g_we_overrode_color
+    // karena game kadang cache uniform dan tidak panggil glUniform4fv lagi
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d override=%d",
-                   g_current_program, count, g_we_overrode_color);
+            logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d", g_current_program, count);
             g_log_draw_count++;
         }
         if (g_depth_bypass) {
             two_pass_draw_elements(mode, count, type, indices);
         } else {
             force_opaque_state();
+            set_uniform_color(g_color);
             orig_glDrawElements(mode, count, type, indices);
         }
         return;
@@ -432,16 +434,16 @@ static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
 }
 
 static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    if (g_enabled && g_is_ped_program) {
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d override=%d",
-                   g_current_program, count, g_we_overrode_color);
+            logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d", g_current_program, count);
             g_log_draw_count++;
         }
         if (g_depth_bypass) {
             two_pass_draw_arrays(mode, first, count);
         } else {
             force_opaque_state();
+            set_uniform_color(g_color);
             orig_glDrawArrays(mode, first, count);
         }
         return;
@@ -538,13 +540,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.4|Two-pass wallhack: kuning=behind wall hijau=visible|brruham";
+        "solidskin|2.5|Two-pass wallhack fix: kuning=behind wall hijau=visible, no uniform cache miss|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.4 (two-pass: kuning/hijau)");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.5 (two-pass fix: no uniform cache miss)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -578,7 +580,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.4 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v2.5 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -646,8 +648,8 @@ EXPORT void OnModLoad() {
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.4 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.5 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix: two-pass tanpa tunggu uniform)");
 }
 
 } // extern "C"
