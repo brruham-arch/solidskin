@@ -42,6 +42,7 @@ static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
 static GLuint  g_current_program       = 0;
 static GLint   g_materialDiffuse_loc   = -2; // -2 = belum di-resolve
 static GLint   g_materialAmbient_loc   = -2;
+static int     g_is_ped_program        = 0;  // 1 = program ini render ped
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void _enable(void)               { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
@@ -63,6 +64,7 @@ static void hook_glUseProgram(GLuint program) {
         g_current_program     = program;
         g_materialDiffuse_loc = -2;
         g_materialAmbient_loc = -2;
+        g_is_ped_program      = 0;
     }
     orig_glUseProgram(program);
 }
@@ -85,6 +87,17 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
     if (g_materialDiffuse_loc == -2) {
         g_materialDiffuse_loc = orig_glGetUniformLocation(g_current_program, "MaterialDiffuse");
         g_materialAmbient_loc = orig_glGetUniformLocation(g_current_program, "MaterialAmbient");
+        // Cek apakah ini shader ped (ada uniform Bones)
+        GLint bones_loc = orig_glGetUniformLocation(g_current_program, "Bones");
+        g_is_ped_program = (bones_loc != -1) ? 1 : 0;
+        logff_("[SOLIDSKIN] prog=%u diffuse=%d bones=%d is_ped=%d",
+               g_current_program, g_materialDiffuse_loc, bones_loc, g_is_ped_program);
+    }
+
+    // Hanya apply ke shader ped
+    if (!g_is_ped_program) {
+        orig_glUniform4fv(location, count, value);
+        return;
     }
 
     if (location != -1 && location == g_materialDiffuse_loc) {
