@@ -8,6 +8,7 @@
 #include <GLES2/gl2.h>
 #include <unordered_map>
 
+
 #define LOG_TAG  "libsolidskin"
 #define LOGFILE  "/storage/emulated/0/solidskin_log.txt"
 #define EXPORT   __attribute__((visibility("default")))
@@ -27,7 +28,8 @@ static void logff_(const char* fmt, ...) {
 // ─── State global ────────────────────────────────────────────────────────────
 static int   g_enabled = 0;
 static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f}; // hijau terang
-static int   g_block_blend = 1; // toggle untuk force-disable GL_BLEND saat ped program aktif
+static int   g_block_blend = 1;       // paksa glDisable(GL_BLEND) saat ped aktif
+static int   g_force_blendfunc = 1;   // pertahanan kedua: paksa glBlendFunc(ONE, ZERO) saat ped aktif
 
 // ─── Program cache (fix FPS drop) ────────────────────────────────────────────
 struct ProgramInfo {
@@ -44,6 +46,8 @@ typedef GLint (*glGetUniformLocation_t)(GLuint, const char*);
 typedef void  (*glEnable_t)(GLenum);
 typedef void  (*glDisable_t)(GLenum);
 typedef void  (*glBlendFunc_t)(GLenum, GLenum);
+typedef void  (*glDrawElements_t)(GLenum, GLsizei, GLenum, const void*);
+typedef void  (*glDrawArrays_t)(GLenum, GLint, GLsizei);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -51,13 +55,17 @@ static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
 static glEnable_t             orig_glEnable             = nullptr;
 static glDisable_t            orig_glDisable            = nullptr;
 static glBlendFunc_t          orig_glBlendFunc          = nullptr;
+static glDrawElements_t       orig_glDrawElements       = nullptr;
+static glDrawArrays_t         orig_glDrawArrays         = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint g_current_program       = 0;
 static GLint  g_materialDiffuse_loc   = -2;
 static GLint  g_materialAmbient_loc   = -2;
 static int    g_is_ped_program        = 0;
-static int    g_blend_currently_on    = 0; // tracking state asli game (bukan state nyata di GPU)
+static int    g_blend_currently_on    = 0; // state blend yg diminta game (dari glEnable/glDisable asli)
+static int    g_we_overrode_color     = 0; // true kalau frame ini sudah ke-trigger override diffuse/ambient
+static int    g_log_draw_count        = 0;
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void _enable(void)  { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
@@ -76,11 +84,28 @@ static void _set_block_blend(int v) {
     logff_("[SOLIDSKIN] block_blend set: %d", g_block_blend);
 }
 static int _get_block_blend(void) { return g_block_blend; }
+static void _set_force_blendfunc(int v) {
+    g_force_blendfunc = v ? 1 : 0;
+    logff_("[SOLIDSKIN] force_blendfunc set: %d", g_force_blendfunc);
+}
+static int _get_force_blendfunc(void) { return g_force_blendfunc; }
+
+// ─── Helper: paksa state non-transparan untuk program saat ini ──────────────
+static inline void force_opaque_state(void) {
+    if (g_blend_currently_on) {
+        orig_glDisable(GL_BLEND);
+    }
+    if (g_force_blendfunc) {
+        // ONE, ZERO = output fragment menggantikan total framebuffer, alpha diabaikan.
+        orig_glBlendFunc(GL_ONE, GL_ZERO);
+    }
+}
 
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
     if (program != g_current_program) {
         g_current_program = program;
+        g_we_overrode_color = 0;
 
         if (program == 0) {
             g_materialDiffuse_loc = -2;
@@ -89,36 +114,29 @@ static void hook_glUseProgram(GLuint program) {
         } else {
             auto it = g_program_cache.find(program);
             if (it != g_program_cache.end()) {
-                // Pakai cache — tidak perlu glGetUniformLocation lagi
                 g_materialDiffuse_loc = it->second.diffuse_loc;
                 g_materialAmbient_loc = it->second.ambient_loc;
                 g_is_ped_program      = it->second.is_ped;
             } else {
-                // Belum pernah dilihat, mark untuk resolve
                 g_materialDiffuse_loc = -2;
                 g_materialAmbient_loc = -2;
                 g_is_ped_program      = 0;
             }
         }
 
-        // Setiap kali program berganti, re-evaluasi apakah blend harus
-        // dipaksa off berdasarkan state blend yang diminta game sebelumnya.
-        if (g_enabled && g_block_blend && g_is_ped_program && g_blend_currently_on) {
-            orig_glDisable(GL_BLEND);
-        } else if (g_blend_currently_on) {
-            orig_glEnable(GL_BLEND);
+        if (g_enabled && g_block_blend && g_is_ped_program) {
+            force_opaque_state();
         }
     }
     orig_glUseProgram(program);
 }
 
-// ─── Hook: glEnable / glDisable (untuk blokir GL_BLEND di ped program) ───────
+// ─── Hook: glEnable / glDisable ──────────────────────────────────────────────
 static void hook_glEnable(GLenum cap) {
     if (cap == GL_BLEND) {
         g_blend_currently_on = 1;
         if (g_enabled && g_block_blend && g_is_ped_program) {
-            // Jangan benar-benar enable blend — supaya alpha output solid 1.0
-            // tidak ke-blend dengan background / texture alpha cutout.
+            // Telan request enable blend untuk ped program.
             return;
         }
     }
@@ -130,6 +148,42 @@ static void hook_glDisable(GLenum cap) {
         g_blend_currently_on = 0;
     }
     orig_glDisable(cap);
+}
+
+// ─── Hook: glBlendFunc (catat apa yg diminta game, override kalau perlu) ────
+static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
+    if (g_enabled && g_force_blendfunc && g_is_ped_program) {
+        orig_glBlendFunc(GL_ONE, GL_ZERO);
+        return;
+    }
+    orig_glBlendFunc(sfactor, dfactor);
+}
+
+// ─── Hook: glDrawElements / glDrawArrays ────────────────────────────────────
+// Pertahanan ketiga: tepat sebelum draw call dieksekusi untuk ped program,
+// pastikan state opaque sudah benar-benar diterapkan di GPU saat ini —
+// menutup race condition kalau ada state lain yang menimpa di antara
+// glUseProgram dan draw call.
+static inline void pre_draw_check(void) {
+    if (g_enabled && g_is_ped_program && g_we_overrode_color) {
+        if (g_block_blend || g_force_blendfunc) {
+            force_opaque_state();
+        }
+        if (g_log_draw_count < 20) {
+            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d", g_current_program, g_blend_currently_on);
+            g_log_draw_count++;
+        }
+    }
+}
+
+static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+    pre_draw_check();
+    orig_glDrawElements(mode, count, type, indices);
+}
+
+static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    pre_draw_check();
+    orig_glDrawArrays(mode, first, count);
 }
 
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
@@ -162,9 +216,8 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
         logff_("[SOLIDSKIN] resolve prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
                g_current_program, d, a, b, is_ped);
 
-        // Program baru terdeteksi sebagai ped DAN blend lagi nyala -> matikan sekarang.
-        if (g_enabled && g_block_blend && g_is_ped_program && g_blend_currently_on) {
-            orig_glDisable(GL_BLEND);
+        if (g_enabled && g_block_blend && g_is_ped_program) {
+            force_opaque_state();
         }
     }
 
@@ -175,12 +228,15 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
 
     if (location != -1 && location == g_materialDiffuse_loc) {
         orig_glUniform4fv(location, count, g_color);
+        g_we_overrode_color = 1;
+        force_opaque_state();
         return;
     }
     if (location != -1 && location == g_materialAmbient_loc) {
-        // Alpha hardcode 1.0f — tidak transparan
         GLfloat ambient[4] = {g_color[0], g_color[1], g_color[2], 1.0f};
         orig_glUniform4fv(location, count, ambient);
+        g_we_overrode_color = 1;
+        force_opaque_state();
         return;
     }
 
@@ -196,6 +252,8 @@ struct SolidSkinAPI {
     void (*get_color)(float* out);
     void (*set_block_blend)(int v);
     int  (*get_block_blend)(void);
+    void (*set_force_blendfunc)(int v);
+    int  (*get_force_blendfunc)(void);
 };
 
 // ─── AML entry points ────────────────────────────────────────────────────────
@@ -203,17 +261,18 @@ extern "C" {
 
 EXPORT SolidSkinAPI solidskin_api = {
     _enable, _disable, _is_enabled, _set_color, _get_color,
-    _set_block_blend, _get_block_blend
+    _set_block_blend, _get_block_blend,
+    _set_force_blendfunc, _get_force_blendfunc
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|1.2|Solid color skin override via GL hook (no-blend)|brruham";
+    static const char* info = "solidskin|1.3|Solid color skin override via GL hook (no-blend, pre-draw enforce)|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v1.2");
+    logf_("[SOLIDSKIN] OnModPreLoad v1.3");
     g_enabled             = 0;
     g_current_program     = 0;
     g_materialDiffuse_loc = -2;
@@ -221,87 +280,84 @@ EXPORT void OnModPreLoad() {
     g_hook_call_count     = 0;
     g_is_ped_program      = 0;
     g_blend_currently_on  = 0;
+    g_we_overrode_color   = 0;
+    g_log_draw_count      = 0;
     g_block_blend         = 1;
+    g_force_blendfunc     = 1;
     g_program_cache.clear();
-    // Hijau terang, full opaque
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
 }
 
 EXPORT void OnModLoad() {
     logf_("[SOLIDSKIN] OnModLoad mulai");
 
-    // 1. Load Dobby
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
     auto dobbyHook = (int(*)(void*, void*, void**))dlsym(hDobby, "DobbyHook");
     if (!dobbyHook) { logf_("[SOLIDSKIN] ERROR: DobbyHook sym tidak ada"); return; }
 
-    // 2. Load libGLESv2
     void* hGLES2 = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hGLES2) { logf_("[SOLIDSKIN] ERROR: libGLESv2.so tidak ada"); return; }
 
-    // 3. glGetUniformLocation (tidak di-hook, hanya dipakai langsung)
     orig_glGetUniformLocation = (glGetUniformLocation_t)dlsym(hGLES2, "glGetUniformLocation");
-    if (!orig_glGetUniformLocation) {
-        logf_("[SOLIDSKIN] ERROR: glGetUniformLocation null"); return;
-    }
+    if (!orig_glGetUniformLocation) { logf_("[SOLIDSKIN] ERROR: glGetUniformLocation null"); return; }
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
 
-    // 4. Hook glUseProgram
     orig_glUseProgram = (glUseProgram_t)dlsym(hGLES2, "glUseProgram");
-    if (!orig_glUseProgram) {
-        logf_("[SOLIDSKIN] ERROR: glUseProgram null"); return;
-    }
-    if (dobbyHook((void*)orig_glUseProgram,
-                  (void*)hook_glUseProgram,
-                  (void**)&orig_glUseProgram) != 0) {
+    if (!orig_glUseProgram) { logf_("[SOLIDSKIN] ERROR: glUseProgram null"); return; }
+    if (dobbyHook((void*)orig_glUseProgram, (void*)hook_glUseProgram, (void**)&orig_glUseProgram) != 0) {
         logf_("[SOLIDSKIN] ERROR: hook glUseProgram gagal"); return;
     }
     logf_("[SOLIDSKIN] hook glUseProgram OK");
 
-    // 5. Hook glUniform4fv
     orig_glUniform4fv = (glUniform4fv_t)dlsym(hGLES2, "glUniform4fv");
-    if (!orig_glUniform4fv) {
-        logf_("[SOLIDSKIN] ERROR: glUniform4fv null"); return;
-    }
+    if (!orig_glUniform4fv) { logf_("[SOLIDSKIN] ERROR: glUniform4fv null"); return; }
     logff_("[SOLIDSKIN] glUniform4fv addr = %p", (void*)orig_glUniform4fv);
-    if (dobbyHook((void*)orig_glUniform4fv,
-                  (void*)hook_glUniform4fv,
-                  (void**)&orig_glUniform4fv) != 0) {
+    if (dobbyHook((void*)orig_glUniform4fv, (void*)hook_glUniform4fv, (void**)&orig_glUniform4fv) != 0) {
         logf_("[SOLIDSKIN] ERROR: hook glUniform4fv gagal"); return;
     }
     logf_("[SOLIDSKIN] hook glUniform4fv OK");
 
-    // 6. Hook glEnable (untuk blok GL_BLEND saat ped program)
     orig_glEnable = (glEnable_t)dlsym(hGLES2, "glEnable");
-    if (!orig_glEnable) {
-        logf_("[SOLIDSKIN] ERROR: glEnable null"); return;
-    }
-    if (dobbyHook((void*)orig_glEnable,
-                  (void*)hook_glEnable,
-                  (void**)&orig_glEnable) != 0) {
+    if (!orig_glEnable) { logf_("[SOLIDSKIN] ERROR: glEnable null"); return; }
+    if (dobbyHook((void*)orig_glEnable, (void*)hook_glEnable, (void**)&orig_glEnable) != 0) {
         logf_("[SOLIDSKIN] ERROR: hook glEnable gagal"); return;
     }
     logf_("[SOLIDSKIN] hook glEnable OK");
 
-    // 7. Hook glDisable (untuk tracking state blend asli game)
     orig_glDisable = (glDisable_t)dlsym(hGLES2, "glDisable");
-    if (!orig_glDisable) {
-        logf_("[SOLIDSKIN] ERROR: glDisable null"); return;
-    }
-    if (dobbyHook((void*)orig_glDisable,
-                  (void*)hook_glDisable,
-                  (void**)&orig_glDisable) != 0) {
+    if (!orig_glDisable) { logf_("[SOLIDSKIN] ERROR: glDisable null"); return; }
+    if (dobbyHook((void*)orig_glDisable, (void*)hook_glDisable, (void**)&orig_glDisable) != 0) {
         logf_("[SOLIDSKIN] ERROR: hook glDisable gagal"); return;
     }
     logf_("[SOLIDSKIN] hook glDisable OK");
 
-    // 8. Tulis alamat API untuk Lua
+    orig_glBlendFunc = (glBlendFunc_t)dlsym(hGLES2, "glBlendFunc");
+    if (!orig_glBlendFunc) { logf_("[SOLIDSKIN] ERROR: glBlendFunc null"); return; }
+    if (dobbyHook((void*)orig_glBlendFunc, (void*)hook_glBlendFunc, (void**)&orig_glBlendFunc) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glBlendFunc gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glBlendFunc OK");
+
+    orig_glDrawElements = (glDrawElements_t)dlsym(hGLES2, "glDrawElements");
+    if (!orig_glDrawElements) { logf_("[SOLIDSKIN] ERROR: glDrawElements null"); return; }
+    if (dobbyHook((void*)orig_glDrawElements, (void*)hook_glDrawElements, (void**)&orig_glDrawElements) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glDrawElements gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glDrawElements OK");
+
+    orig_glDrawArrays = (glDrawArrays_t)dlsym(hGLES2, "glDrawArrays");
+    if (!orig_glDrawArrays) { logf_("[SOLIDSKIN] ERROR: glDrawArrays null"); return; }
+    if (dobbyHook((void*)orig_glDrawArrays, (void*)hook_glDrawArrays, (void**)&orig_glDrawArrays) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glDrawArrays gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glDrawArrays OK");
+
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, warna hijau, block_blend=1");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, warna hijau, block_blend=1, force_blendfunc=1");
 }
 
 } // extern "C"
