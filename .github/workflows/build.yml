@@ -28,14 +28,14 @@ jobs:
 
       - name: Verifikasi
         run: |
-          ls -lh libs/arm64-v8a/
-          file libs/arm64-v8a/libsolidskin.so
+          ls -lh libs/armeabi-v7a/
+          file libs/armeabi-v7a/libsolidskin.so
           $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
-            -D libs/arm64-v8a/libsolidskin.so | grep " T "
+            -D libs/armeabi-v7a/libsolidskin.so | grep " T "
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: libsolidskin-arm64
-          path: libs/arm64-v8a/libsolidskin.so
+          path: libs/armeabi-v7a/libsolidskin.so
           retention-days: 14
