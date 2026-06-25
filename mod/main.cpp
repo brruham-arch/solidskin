@@ -194,7 +194,8 @@ EXPORT void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
-    logf_("[SOLIDSKIN] OnModLoad SELESAI");
+    g_enabled = 1;
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled");
 }
 
 } // extern "C"
