@@ -149,12 +149,12 @@ EXPORT void OnModLoad() {
     uintptr_t base = (uintptr_t)hGTASA;
     logff_("[SOLIDSKIN] libGTASA base = 0x%lx", (unsigned long)base);
 
-    // ── 3. Ambil orig_glGetUniformLocation dari GOT libGTASA ──────────────
-    // GOT offset hasil analisa: 0x6755ec
-    uintptr_t got_getUniform = base + 0x6755ec;
-    orig_glGetUniformLocation = *(glGetUniformLocation_t*)got_getUniform;
+    // ── 3. Ambil glGetUniformLocation via dlsym libGLESv2 ────────────────
+    void* hGLES2 = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!hGLES2) { logf_("[SOLIDSKIN] ERROR: libGLESv2.so tidak ada"); return; }
+    orig_glGetUniformLocation = (glGetUniformLocation_t)dlsym(hGLES2, "glGetUniformLocation");
     if (!orig_glGetUniformLocation) {
-        logf_("[SOLIDSKIN] ERROR: glGetUniformLocation ptr null");
+        logf_("[SOLIDSKIN] ERROR: glGetUniformLocation dlsym null");
         return;
     }
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
