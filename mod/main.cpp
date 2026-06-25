@@ -30,11 +30,12 @@ static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 static int   g_block_blend = 1;
 static int   g_force_blendfunc = 1;
 static int   g_texture_override = 1;
+static int   g_depth_bypass = 1; // fitur baru: wallhack ringan
 
 // ─── Solid texture state ─────────────────────────────────────────────────────
 static GLuint g_solid_tex = 0;
 static int    g_solid_tex_ready = 0;
-static int    g_solid_tex_init_attempted = 0; // supaya cuma coba init sekali, hindari spam log kalau gagal terus
+static int    g_solid_tex_init_attempted = 0;
 static uint8_t g_solid_tex_rgba[4] = {0, 255, 0, 255};
 static int g_active_texture_unit = GL_TEXTURE0;
 
@@ -61,6 +62,8 @@ typedef void  (*glGenTextures_t)(GLsizei, GLuint*);
 typedef void  (*glTexImage2D_t)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
 typedef void  (*glTexParameteri_t)(GLenum, GLenum, GLint);
 typedef GLenum (*glGetError_t)(void);
+typedef void  (*glDepthFunc_t)(GLenum);
+typedef void  (*glDepthMask_t)(GLboolean);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -76,6 +79,8 @@ static glGenTextures_t        orig_glGenTextures        = nullptr;
 static glTexImage2D_t         orig_glTexImage2D         = nullptr;
 static glTexParameteri_t      orig_glTexParameteri      = nullptr;
 static glGetError_t           orig_glGetError           = nullptr;
+static glDepthFunc_t          orig_glDepthFunc          = nullptr;
+static glDepthMask_t          orig_glDepthMask          = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint g_current_program       = 0;
@@ -87,9 +92,14 @@ static int    g_we_overrode_color     = 0;
 static int    g_log_draw_count        = 0;
 static int    g_log_bind_count        = 0;
 
+// Simpan depth func/mask yg "diminta game" supaya bisa dipulihkan begitu
+// program berganti ke non-ped (mirip pola g_blend_currently_on sebelumnya).
+static GLenum g_game_depth_func = GL_LESS;
+static GLboolean g_game_depth_mask = GL_TRUE;
+
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void sync_solid_tex_color(void);
-static void try_init_solid_texture(void); // lazy init, dipanggil dari render thread
+static void try_init_solid_texture(void);
 
 static void _enable(void)  { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
 static void _disable(void) { g_enabled = 0; logf_("[SOLIDSKIN] disabled"); }
@@ -107,18 +117,17 @@ static void _set_block_blend(int v) { g_block_blend = v ? 1 : 0; }
 static int  _get_block_blend(void) { return g_block_blend; }
 static void _set_force_blendfunc(int v) { g_force_blendfunc = v ? 1 : 0; }
 static int  _get_force_blendfunc(void) { return g_force_blendfunc; }
-static void _set_texture_override(int v) {
-    g_texture_override = v ? 1 : 0;
-    logff_("[SOLIDSKIN] texture_override set: %d", g_texture_override);
-}
+static void _set_texture_override(int v) { g_texture_override = v ? 1 : 0; }
 static int  _get_texture_override(void) { return g_texture_override; }
-static void _retry_texture_init(void) {
-    g_solid_tex_init_attempted = 0;
-    logf_("[SOLIDSKIN] texture init di-reset, akan dicoba lagi di hook berikutnya");
+static void _retry_texture_init(void) { g_solid_tex_init_attempted = 0; }
+static int  _is_texture_ready(void) { return g_solid_tex_ready; }
+static void _set_depth_bypass(int v) {
+    g_depth_bypass = v ? 1 : 0;
+    logff_("[SOLIDSKIN] depth_bypass set: %d", g_depth_bypass);
 }
-static int _is_texture_ready(void) { return g_solid_tex_ready; }
+static int  _get_depth_bypass(void) { return g_depth_bypass; }
 
-// ─── Helper: paksa state non-transparan ─────────────────────────────────────
+// ─── Helper: paksa state non-transparan untuk program saat ini ──────────────
 static inline void force_opaque_state(void) {
     if (g_blend_currently_on) {
         orig_glDisable(GL_BLEND);
@@ -128,11 +137,26 @@ static inline void force_opaque_state(void) {
     }
 }
 
+// ─── Helper: paksa/pulihkan depth state untuk program saat ini ──────────────
+static inline void apply_depth_state_for_current_program(void) {
+    if (!orig_glDepthFunc || !orig_glDepthMask) return;
+
+    if (g_enabled && g_depth_bypass && g_is_ped_program) {
+        // Wallhack: ped selalu lolos depth test (ALWAYS), dan tidak menulis
+        // ke depth buffer (mask FALSE) supaya tidak salah meng-occlude
+        // objek lain yang harusnya tetap normal di belakang/depan ped.
+        orig_glDepthFunc(GL_ALWAYS);
+        orig_glDepthMask(GL_FALSE);
+    } else {
+        // Pulihkan depth state asli yg diminta game terakhir kali.
+        orig_glDepthFunc(g_game_depth_func);
+        orig_glDepthMask(g_game_depth_mask);
+    }
+}
+
 // ─── Solid texture: lazy init di render thread ──────────────────────────────
 static void upload_solid_tex_pixel(void) {
     if (!g_solid_tex_ready || !orig_glBindTexture || !orig_glTexImage2D) return;
-    static int in_upload = 0;
-    in_upload = 1;
     orig_glBindTexture(GL_TEXTURE_2D, g_solid_tex);
     orig_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_solid_tex_rgba);
     if (orig_glTexParameteri) {
@@ -141,7 +165,6 @@ static void upload_solid_tex_pixel(void) {
         orig_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         orig_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    in_upload = 0;
     logff_("[SOLIDSKIN] solid_tex diupload ulang: tex_id=%u rgba=%d,%d,%d,%d",
            g_solid_tex, g_solid_tex_rgba[0], g_solid_tex_rgba[1], g_solid_tex_rgba[2], g_solid_tex_rgba[3]);
 }
@@ -154,8 +177,6 @@ static void sync_solid_tex_color(void) {
     if (g_solid_tex_ready) upload_solid_tex_pixel();
 }
 
-// Dipanggil dari DALAM hook GL (render thread, context pasti current).
-// Aman dipanggil berkali-kali -- hanya benar-benar mengeksekusi sekali.
 static void try_init_solid_texture(void) {
     if (g_solid_tex_ready || g_solid_tex_init_attempted) return;
     g_solid_tex_init_attempted = 1;
@@ -200,7 +221,6 @@ static void hook_glBindTexture(GLenum target, GLuint texture) {
         return;
     }
 
-    // Lazy init pertama kali kita benar2 berada di render thread lewat hook ini.
     if (g_enabled && g_texture_override && !g_solid_tex_ready) {
         try_init_solid_texture();
     }
@@ -234,10 +254,27 @@ static void hook_glTexParameteri(GLenum target, GLenum pname, GLint param) {
     orig_glTexParameteri(target, pname, param);
 }
 
+// ─── Hook: glDepthFunc / glDepthMask ─────────────────────────────────────────
+static void hook_glDepthFunc(GLenum func) {
+    g_game_depth_func = func;
+    if (g_enabled && g_depth_bypass && g_is_ped_program) {
+        orig_glDepthFunc(GL_ALWAYS);
+        return;
+    }
+    orig_glDepthFunc(func);
+}
+
+static void hook_glDepthMask(GLboolean flag) {
+    g_game_depth_mask = flag;
+    if (g_enabled && g_depth_bypass && g_is_ped_program) {
+        orig_glDepthMask(GL_FALSE);
+        return;
+    }
+    orig_glDepthMask(flag);
+}
+
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
-    // Lazy init juga dicoba di sini sbg jalur cadangan kalau glBindTexture
-    // entah kenapa belum pernah terpanggil duluan.
     if (g_enabled && g_texture_override && !g_solid_tex_ready) {
         try_init_solid_texture();
     }
@@ -266,6 +303,9 @@ static void hook_glUseProgram(GLuint program) {
         if (g_enabled && g_block_blend && g_is_ped_program) {
             force_opaque_state();
         }
+        // Re-evaluasi depth state setiap program berganti -- penting supaya
+        // ped berikutnya/sebelumnya tidak mewarisi depth state yg salah.
+        apply_depth_state_for_current_program();
     }
     orig_glUseProgram(program);
 }
@@ -303,8 +343,14 @@ static inline void pre_draw_check(void) {
         if (g_block_blend || g_force_blendfunc) {
             force_opaque_state();
         }
+        // Re-apply tepat sebelum draw -- pertahanan terakhir sama seperti
+        // pola blend sebelumnya, menutup race condition kalau ada state
+        // lain yg menimpa di antara glUseProgram dan draw call.
+        apply_depth_state_for_current_program();
+
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d tex_ready=%d", g_current_program, g_blend_currently_on, g_solid_tex_ready);
+            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d tex_ready=%d depth_func_game=0x%x",
+                   g_current_program, g_blend_currently_on, g_solid_tex_ready, g_game_depth_func);
             g_log_draw_count++;
         }
     }
@@ -352,6 +398,7 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
         if (g_enabled && g_block_blend && g_is_ped_program) {
             force_opaque_state();
         }
+        apply_depth_state_for_current_program();
     }
 
     if (!g_is_ped_program) {
@@ -391,6 +438,8 @@ struct SolidSkinAPI {
     int  (*get_texture_override)(void);
     void (*retry_texture_init)(void);
     int  (*is_texture_ready)(void);
+    void (*set_depth_bypass)(int v);
+    int  (*get_depth_bypass)(void);
 };
 
 extern "C" {
@@ -400,17 +449,18 @@ EXPORT SolidSkinAPI solidskin_api = {
     _set_block_blend, _get_block_blend,
     _set_force_blendfunc, _get_force_blendfunc,
     _set_texture_override, _get_texture_override,
-    _retry_texture_init, _is_texture_ready
+    _retry_texture_init, _is_texture_ready,
+    _set_depth_bypass, _get_depth_bypass
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|2.1|Solid color skin override + lazy texture substitution|brruham";
+    static const char* info = "solidskin|2.2|Solid color skin override + texture substitution + depth bypass (wallhack)|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.1");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.2");
     g_enabled                   = 0;
     g_current_program           = 0;
     g_materialDiffuse_loc       = -2;
@@ -424,10 +474,13 @@ EXPORT void OnModPreLoad() {
     g_block_blend               = 1;
     g_force_blendfunc           = 1;
     g_texture_override          = 1;
+    g_depth_bypass              = 1;
     g_solid_tex                 = 0;
     g_solid_tex_ready           = 0;
     g_solid_tex_init_attempted  = 0;
     g_active_texture_unit       = GL_TEXTURE0;
+    g_game_depth_func           = GL_LESS;
+    g_game_depth_mask           = GL_TRUE;
     g_program_cache.clear();
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
 }
@@ -448,11 +501,7 @@ EXPORT void OnModLoad() {
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
 
     orig_glGetError = (glGetError_t)dlsym(hGLES2, "glGetError");
-    if (orig_glGetError) {
-        logf_("[SOLIDSKIN] glGetError tersedia (tidak di-hook, dipakai langsung)");
-    } else {
-        logf_("[SOLIDSKIN] WARNING: glGetError tidak ditemukan, error texture tidak akan terdiagnosis detail");
-    }
+    if (!orig_glGetError) logf_("[SOLIDSKIN] WARNING: glGetError tidak ditemukan");
 
     orig_glUseProgram = (glUseProgram_t)dlsym(hGLES2, "glUseProgram");
     if (!orig_glUseProgram) { logf_("[SOLIDSKIN] ERROR: glUseProgram null"); return; }
@@ -543,16 +592,28 @@ EXPORT void OnModLoad() {
         }
     }
 
-    // CATATAN: solid texture TIDAK dibuat di sini lagi. Dibuat lazy, pertama
-    // kali hook_glBindTexture atau hook_glUseProgram terpanggil dari render
-    // thread yang benar (lihat try_init_solid_texture()).
+    // ── Depth hooks (fitur baru v2.2) ──
+    orig_glDepthFunc = (glDepthFunc_t)dlsym(hGLES2, "glDepthFunc");
+    if (!orig_glDepthFunc) { logf_("[SOLIDSKIN] ERROR: glDepthFunc null"); return; }
+    if (dobbyHook((void*)orig_glDepthFunc, (void*)hook_glDepthFunc, (void**)&orig_glDepthFunc) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glDepthFunc gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glDepthFunc OK");
+
+    orig_glDepthMask = (glDepthMask_t)dlsym(hGLES2, "glDepthMask");
+    if (!orig_glDepthMask) { logf_("[SOLIDSKIN] ERROR: glDepthMask null"); return; }
+    if (dobbyHook((void*)orig_glDepthMask, (void*)hook_glDepthMask, (void**)&orig_glDepthMask) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glDepthMask gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glDepthMask OK");
+
     logf_("[SOLIDSKIN] solid_tex akan diinisialisasi lazy di render thread");
 
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, texture_override=1, block_blend=1, force_blendfunc=1");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, texture_override=1, block_blend=1, force_blendfunc=1, depth_bypass=1");
 }
 
 } // extern "C"
