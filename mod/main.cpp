@@ -69,7 +69,13 @@ static void hook_glUseProgram(GLuint program) {
 
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
 // Intercept saat MaterialDiffuse atau MaterialAmbient di-set
+static int g_hook_call_count = 0;
 static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* value) {
+    // Log 10 panggilan pertama untuk verifikasi hook aktif
+    if (g_hook_call_count < 10) {
+        logff_("[SOLIDSKIN] glUniform4fv called: loc=%d enabled=%d prog=%u", location, g_enabled, g_current_program);
+        g_hook_call_count++;
+    }
     if (!g_enabled || g_current_program == 0) {
         orig_glUniform4fv(location, count, value);
         return;
