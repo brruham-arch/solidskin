@@ -26,19 +26,16 @@ static void logff_(const char* fmt, ...) {
 
 // ─── State global ────────────────────────────────────────────────────────────
 static int   g_enabled = 0;
-static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f}; // hijau terang, dipakai jg utk texture
+static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 static int   g_block_blend = 1;
 static int   g_force_blendfunc = 1;
-static int   g_texture_override = 1; // toggle utama fitur baru ini
+static int   g_texture_override = 1;
 
 // ─── Solid texture state ─────────────────────────────────────────────────────
-static GLuint g_solid_tex = 0;          // texture id 1x1 hasil bikinan kita
+static GLuint g_solid_tex = 0;
 static int    g_solid_tex_ready = 0;
-static uint8_t g_solid_tex_rgba[4] = {0, 255, 0, 255}; // disinkron dgn g_color
-
-// Supaya glGetTexParameter / dlsym lain ttp aman, dan supaya kita tau apakah
-// texture yg di-bind game sebenarnya texture ped atau bukan, kita tandai unit
-// aktif + texture asli yg "ditutupi" supaya bisa dipulihkan saat unbind.
+static int    g_solid_tex_init_attempted = 0; // supaya cuma coba init sekali, hindari spam log kalau gagal terus
+static uint8_t g_solid_tex_rgba[4] = {0, 255, 0, 255};
 static int g_active_texture_unit = GL_TEXTURE0;
 
 // ─── Program cache ────────────────────────────────────────────────────────────
@@ -63,6 +60,7 @@ typedef void  (*glActiveTexture_t)(GLenum);
 typedef void  (*glGenTextures_t)(GLsizei, GLuint*);
 typedef void  (*glTexImage2D_t)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
 typedef void  (*glTexParameteri_t)(GLenum, GLenum, GLint);
+typedef GLenum (*glGetError_t)(void);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -77,6 +75,7 @@ static glActiveTexture_t      orig_glActiveTexture      = nullptr;
 static glGenTextures_t        orig_glGenTextures        = nullptr;
 static glTexImage2D_t         orig_glTexImage2D         = nullptr;
 static glTexParameteri_t      orig_glTexParameteri      = nullptr;
+static glGetError_t           orig_glGetError           = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint g_current_program       = 0;
@@ -90,6 +89,7 @@ static int    g_log_bind_count        = 0;
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void sync_solid_tex_color(void);
+static void try_init_solid_texture(void); // lazy init, dipanggil dari render thread
 
 static void _enable(void)  { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
 static void _disable(void) { g_enabled = 0; logf_("[SOLIDSKIN] disabled"); }
@@ -112,8 +112,13 @@ static void _set_texture_override(int v) {
     logff_("[SOLIDSKIN] texture_override set: %d", g_texture_override);
 }
 static int  _get_texture_override(void) { return g_texture_override; }
+static void _retry_texture_init(void) {
+    g_solid_tex_init_attempted = 0;
+    logf_("[SOLIDSKIN] texture init di-reset, akan dicoba lagi di hook berikutnya");
+}
+static int _is_texture_ready(void) { return g_solid_tex_ready; }
 
-// ─── Helper: paksa state non-transparan untuk program saat ini ──────────────
+// ─── Helper: paksa state non-transparan ─────────────────────────────────────
 static inline void force_opaque_state(void) {
     if (g_blend_currently_on) {
         orig_glDisable(GL_BLEND);
@@ -123,16 +128,11 @@ static inline void force_opaque_state(void) {
     }
 }
 
-// ─── Solid texture: dibuat sekali, lalu di-upload ulang isinya tiap warna ganti ─
+// ─── Solid texture: lazy init di render thread ──────────────────────────────
 static void upload_solid_tex_pixel(void) {
     if (!g_solid_tex_ready || !orig_glBindTexture || !orig_glTexImage2D) return;
-    GLint prev_tex = 0; // kita tidak query GL_TEXTURE_BINDING_2D (butuh glGetIntegerv,
-                         // tidak kita hook) -- cukup bind, upload, lalu bind balik
-                         // texture yg "sedang aktif menurut game" di hook_glBindTexture
-                         // sebab urutan call kita sudah tau dari trace: upload ini
-                         // hanya dipanggil dari OnModLoad atau dari _set_color (jarang),
-                         // bukan di hot path render, jadi aman walau state GL berubah sesaat.
-    (void)prev_tex;
+    static int in_upload = 0;
+    in_upload = 1;
     orig_glBindTexture(GL_TEXTURE_2D, g_solid_tex);
     orig_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_solid_tex_rgba);
     if (orig_glTexParameteri) {
@@ -141,6 +141,7 @@ static void upload_solid_tex_pixel(void) {
         orig_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         orig_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+    in_upload = 0;
     logff_("[SOLIDSKIN] solid_tex diupload ulang: tex_id=%u rgba=%d,%d,%d,%d",
            g_solid_tex, g_solid_tex_rgba[0], g_solid_tex_rgba[1], g_solid_tex_rgba[2], g_solid_tex_rgba[3]);
 }
@@ -149,20 +150,41 @@ static void sync_solid_tex_color(void) {
     g_solid_tex_rgba[0] = (uint8_t)(g_color[0] * 255.0f + 0.5f);
     g_solid_tex_rgba[1] = (uint8_t)(g_color[1] * 255.0f + 0.5f);
     g_solid_tex_rgba[2] = (uint8_t)(g_color[2] * 255.0f + 0.5f);
-    g_solid_tex_rgba[3] = 255; // selalu full opaque, ini intinya fitur ini
+    g_solid_tex_rgba[3] = 255;
     if (g_solid_tex_ready) upload_solid_tex_pixel();
 }
 
-static void create_solid_texture(void) {
-    if (!orig_glGenTextures) { logf_("[SOLIDSKIN] WARNING: glGenTextures tidak ter-hook, skip texture override"); return; }
+// Dipanggil dari DALAM hook GL (render thread, context pasti current).
+// Aman dipanggil berkali-kali -- hanya benar-benar mengeksekusi sekali.
+static void try_init_solid_texture(void) {
+    if (g_solid_tex_ready || g_solid_tex_init_attempted) return;
+    g_solid_tex_init_attempted = 1;
+
+    if (!orig_glGenTextures || !orig_glBindTexture || !orig_glTexImage2D) {
+        logf_("[SOLIDSKIN] ERROR: fungsi texture belum siap, skip init solid_tex");
+        return;
+    }
+
     GLuint tex = 0;
     orig_glGenTextures(1, &tex);
-    if (tex == 0) { logf_("[SOLIDSKIN] ERROR: glGenTextures gagal alokasi id"); return; }
+
+    if (orig_glGetError) {
+        GLenum err = orig_glGetError();
+        if (err != GL_NO_ERROR) {
+            logff_("[SOLIDSKIN] glGenTextures glGetError=0x%x (tex_id=%u)", err, tex);
+        }
+    }
+
+    if (tex == 0) {
+        logf_("[SOLIDSKIN] ERROR: glGenTextures masih gagal walau dipanggil dari render thread hook");
+        return;
+    }
+
     g_solid_tex = tex;
     sync_solid_tex_color();
     g_solid_tex_ready = 1;
     upload_solid_tex_pixel();
-    logff_("[SOLIDSKIN] solid_tex dibuat: tex_id=%u", g_solid_tex);
+    logff_("[SOLIDSKIN] solid_tex berhasil dibuat (lazy, render thread): tex_id=%u", g_solid_tex);
 }
 
 // ─── Hook: glActiveTexture / glBindTexture ──────────────────────────────────
@@ -172,12 +194,15 @@ static void hook_glActiveTexture(GLenum texture) {
 }
 
 static void hook_glBindTexture(GLenum target, GLuint texture) {
-    // Jangan ganggu bind yg dilakukan oleh upload_solid_tex_pixel() sendiri
-    // (rekursi tak terbatas kalau kita redirect bind ke g_solid_tex itu sendiri).
     static int in_self_bind = 0;
     if (in_self_bind) {
         orig_glBindTexture(target, texture);
         return;
+    }
+
+    // Lazy init pertama kali kita benar2 berada di render thread lewat hook ini.
+    if (g_enabled && g_texture_override && !g_solid_tex_ready) {
+        try_init_solid_texture();
     }
 
     if (g_enabled && g_texture_override && g_solid_tex_ready &&
@@ -197,7 +222,6 @@ static void hook_glBindTexture(GLenum target, GLuint texture) {
     orig_glBindTexture(target, texture);
 }
 
-// ─── Hook: glGenTextures / glTexImage2D / glTexParameteri (passthrough) ────
 static void hook_glGenTextures(GLsizei n, GLuint* textures) {
     orig_glGenTextures(n, textures);
 }
@@ -212,6 +236,12 @@ static void hook_glTexParameteri(GLenum target, GLenum pname, GLint param) {
 
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
+    // Lazy init juga dicoba di sini sbg jalur cadangan kalau glBindTexture
+    // entah kenapa belum pernah terpanggil duluan.
+    if (g_enabled && g_texture_override && !g_solid_tex_ready) {
+        try_init_solid_texture();
+    }
+
     if (program != g_current_program) {
         g_current_program = program;
         g_we_overrode_color = 0;
@@ -274,7 +304,7 @@ static inline void pre_draw_check(void) {
             force_opaque_state();
         }
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d", g_current_program, g_blend_currently_on);
+            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d tex_ready=%d", g_current_program, g_blend_currently_on, g_solid_tex_ready);
             g_log_draw_count++;
         }
     }
@@ -359,6 +389,8 @@ struct SolidSkinAPI {
     int  (*get_force_blendfunc)(void);
     void (*set_texture_override)(int v);
     int  (*get_texture_override)(void);
+    void (*retry_texture_init)(void);
+    int  (*is_texture_ready)(void);
 };
 
 extern "C" {
@@ -367,33 +399,35 @@ EXPORT SolidSkinAPI solidskin_api = {
     _enable, _disable, _is_enabled, _set_color, _get_color,
     _set_block_blend, _get_block_blend,
     _set_force_blendfunc, _get_force_blendfunc,
-    _set_texture_override, _get_texture_override
+    _set_texture_override, _get_texture_override,
+    _retry_texture_init, _is_texture_ready
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|2.0|Solid color skin override via GL hook + texture substitution|brruham";
+    static const char* info = "solidskin|2.1|Solid color skin override + lazy texture substitution|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.0");
-    g_enabled             = 0;
-    g_current_program     = 0;
-    g_materialDiffuse_loc = -2;
-    g_materialAmbient_loc = -2;
-    g_hook_call_count     = 0;
-    g_is_ped_program      = 0;
-    g_blend_currently_on  = 0;
-    g_we_overrode_color   = 0;
-    g_log_draw_count      = 0;
-    g_log_bind_count      = 0;
-    g_block_blend         = 1;
-    g_force_blendfunc     = 1;
-    g_texture_override    = 1;
-    g_solid_tex           = 0;
-    g_solid_tex_ready      = 0;
-    g_active_texture_unit = GL_TEXTURE0;
+    logf_("[SOLIDSKIN] OnModPreLoad v2.1");
+    g_enabled                   = 0;
+    g_current_program           = 0;
+    g_materialDiffuse_loc       = -2;
+    g_materialAmbient_loc       = -2;
+    g_hook_call_count           = 0;
+    g_is_ped_program            = 0;
+    g_blend_currently_on        = 0;
+    g_we_overrode_color         = 0;
+    g_log_draw_count            = 0;
+    g_log_bind_count            = 0;
+    g_block_blend               = 1;
+    g_force_blendfunc           = 1;
+    g_texture_override          = 1;
+    g_solid_tex                 = 0;
+    g_solid_tex_ready           = 0;
+    g_solid_tex_init_attempted  = 0;
+    g_active_texture_unit       = GL_TEXTURE0;
     g_program_cache.clear();
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
 }
@@ -412,6 +446,13 @@ EXPORT void OnModLoad() {
     orig_glGetUniformLocation = (glGetUniformLocation_t)dlsym(hGLES2, "glGetUniformLocation");
     if (!orig_glGetUniformLocation) { logf_("[SOLIDSKIN] ERROR: glGetUniformLocation null"); return; }
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
+
+    orig_glGetError = (glGetError_t)dlsym(hGLES2, "glGetError");
+    if (orig_glGetError) {
+        logf_("[SOLIDSKIN] glGetError tersedia (tidak di-hook, dipakai langsung)");
+    } else {
+        logf_("[SOLIDSKIN] WARNING: glGetError tidak ditemukan, error texture tidak akan terdiagnosis detail");
+    }
 
     orig_glUseProgram = (glUseProgram_t)dlsym(hGLES2, "glUseProgram");
     if (!orig_glUseProgram) { logf_("[SOLIDSKIN] ERROR: glUseProgram null"); return; }
@@ -462,7 +503,6 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glDrawArrays OK");
 
-    // ── Texture hooks ──
     orig_glActiveTexture = (glActiveTexture_t)dlsym(hGLES2, "glActiveTexture");
     if (!orig_glActiveTexture) { logf_("[SOLIDSKIN] ERROR: glActiveTexture null"); return; }
     if (dobbyHook((void*)orig_glActiveTexture, (void*)hook_glActiveTexture, (void**)&orig_glActiveTexture) != 0) {
@@ -480,7 +520,7 @@ EXPORT void OnModLoad() {
     orig_glGenTextures = (glGenTextures_t)dlsym(hGLES2, "glGenTextures");
     if (!orig_glGenTextures) { logf_("[SOLIDSKIN] ERROR: glGenTextures null"); return; }
     if (dobbyHook((void*)orig_glGenTextures, (void*)hook_glGenTextures, (void**)&orig_glGenTextures) != 0) {
-        logf_("[SOLIDSKIN] WARNING: hook glGenTextures gagal, lanjut tanpa hook (masih bisa dipakai langsung)");
+        logf_("[SOLIDSKIN] WARNING: hook glGenTextures gagal, lanjut tanpa hook");
     } else {
         logf_("[SOLIDSKIN] hook glGenTextures OK");
     }
@@ -503,8 +543,10 @@ EXPORT void OnModLoad() {
         }
     }
 
-    // Buat texture 1x1 solid SETELAH semua hook texture siap.
-    create_solid_texture();
+    // CATATAN: solid texture TIDAK dibuat di sini lagi. Dibuat lazy, pertama
+    // kali hook_glBindTexture atau hook_glUseProgram terpanggil dari render
+    // thread yang benar (lihat try_init_solid_texture()).
+    logf_("[SOLIDSKIN] solid_tex akan diinisialisasi lazy di render thread");
 
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
