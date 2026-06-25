@@ -352,9 +352,10 @@ static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
 // supaya rendering frame berikutnya tidak terganggu.
 
 static inline void set_uniform_color(const float col[4]) {
-    if (g_materialDiffuse_loc != -1 && g_materialDiffuse_loc >= 0)
+    // Tidak perlu cek g_we_overrode_color di sini
+    if (g_materialDiffuse_loc >= 0)
         orig_glUniform4fv(g_materialDiffuse_loc, 1, col);
-    if (g_materialAmbient_loc != -1 && g_materialAmbient_loc >= 0)
+    if (g_materialAmbient_loc >= 0)
         orig_glUniform4fv(g_materialAmbient_loc, 1, col);
 }
 
@@ -412,9 +413,11 @@ static void two_pass_draw_arrays(GLenum mode, GLint first, GLsizei count) {
 
 // ─── Hook: glDrawElements / glDrawArrays ─────────────────────────────────────
 static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    if (g_enabled && g_is_ped_program && g_we_overrode_color) {
+    // Jalankan two-pass kalau is_ped=1, TERLEPAS dari g_we_overrode_color
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d", g_current_program, count);
+            logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d override=%d",
+                   g_current_program, count, g_we_overrode_color);
             g_log_draw_count++;
         }
         if (g_depth_bypass) {
@@ -429,9 +432,10 @@ static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
 }
 
 static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    if (g_enabled && g_is_ped_program && g_we_overrode_color) {
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d", g_current_program, count);
+            logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d override=%d",
+                   g_current_program, count, g_we_overrode_color);
             g_log_draw_count++;
         }
         if (g_depth_bypass) {
