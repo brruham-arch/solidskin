@@ -26,37 +26,67 @@ static void logff_(const char* fmt, ...) {
 
 // ─── State global ────────────────────────────────────────────────────────────
 static int   g_enabled = 0;
-static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f}; // hijau terang
-static int   g_block_blend = 1;       // paksa glDisable(GL_BLEND) saat ped aktif
-static int   g_force_blendfunc = 1;   // pertahanan kedua: paksa glBlendFunc(ONE, ZERO) saat ped aktif
+static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+static int   g_block_blend = 1;
+static int   g_force_blendfunc = 1;
 
 // ─── Trace mode ──────────────────────────────────────────────────────────────
-// Begitu program ped pertama kali terdeteksi, kita log SEMUA gl call relevan
-// secara berurutan (tanpa filter) selama N call berikutnya, supaya urutan
-// asli glEnable/glDisable/glBlendFunc/glUniform4fv/glDraw* terhadap
-// glUseProgram bisa dipastikan, bukan ditebak.
-static int  g_trace_active   = 0;
+// Trigger sekarang: draw call PERTAMA untuk program is_ped=1 yang sudah
+// di-override warnanya. Dari titik itu kita log mundur sedikit (lewat
+// ring buffer kecil) + maju jauh (400 call) supaya frame lengkap tertangkap.
+static int  g_trace_active    = 0;
 static int  g_trace_remaining = 0;
-#define TRACE_BUDGET 80
+static int  g_trace_done_once = 0;
+#define TRACE_BUDGET 400
+#define RING_SIZE 16
 
-static inline void trace_start_if_needed(void) {
-    if (!g_trace_active && g_trace_remaining == 0) {
-        // Belum pernah dipakai sama sekali -> mulai sekali saja di seluruh run.
-    }
+static char g_ring[RING_SIZE][160];
+static int  g_ring_pos = 0;
+static int  g_ring_count = 0;
+
+static inline void ring_push(const char* msg) {
+    snprintf(g_ring[g_ring_pos], sizeof(g_ring[g_ring_pos]), "%s", msg);
+    g_ring_pos = (g_ring_pos + 1) % RING_SIZE;
+    if (g_ring_count < RING_SIZE) g_ring_count++;
 }
+static inline void ring_flush_to_log(void) {
+    logf_("[TRACE] --- ring buffer (sebelum trigger) ---");
+    int start = (g_ring_pos - g_ring_count + RING_SIZE) % RING_SIZE;
+    for (int i = 0; i < g_ring_count; i++) {
+        int idx = (start + i) % RING_SIZE;
+        logff_("[TRACE-PRE] %s", g_ring[idx]);
+    }
+    logf_("[TRACE] --- end ring buffer ---");
+}
+
 static inline void trace_log(const char* fmt, ...) {
-    if (!g_trace_active) return;
-    char buf[256];
+    char buf[200];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    logff_("[TRACE] %s", buf);
-    g_trace_remaining--;
-    if (g_trace_remaining <= 0) {
-        g_trace_active = 0;
-        logf_("[TRACE] === trace window selesai ===");
+
+    if (g_trace_active) {
+        logff_("[TRACE] %s", buf);
+        g_trace_remaining--;
+        if (g_trace_remaining <= 0) {
+            g_trace_active = 0;
+            logf_("[TRACE] === trace window selesai ===");
+        }
+    } else if (!g_trace_done_once) {
+        // Belum trigger -> simpan ke ring buffer sebagai konteks "sebelum".
+        ring_push(buf);
     }
 }
 
-// ─── Program cache (fix FPS drop) ────────────────────────────────────────────
+static inline void maybe_trigger_trace(const char* reason) {
+    if (!g_trace_done_once) {
+        g_trace_done_once = 1;
+        g_trace_active = 1;
+        g_trace_remaining = TRACE_BUDGET;
+        logff_("[TRACE] === TRIGGER: %s ===", reason);
+        ring_flush_to_log();
+    }
+}
+
+// ─── Program cache ────────────────────────────────────────────────────────────
 struct ProgramInfo {
     GLint diffuse_loc;
     GLint ambient_loc;
@@ -73,8 +103,8 @@ typedef void  (*glDisable_t)(GLenum);
 typedef void  (*glBlendFunc_t)(GLenum, GLenum);
 typedef void  (*glDrawElements_t)(GLenum, GLsizei, GLenum, const void*);
 typedef void  (*glDrawArrays_t)(GLenum, GLint, GLsizei);
-typedef void  (*glColorMask_t)(GLboolean, GLboolean, GLboolean, GLboolean);
-typedef void  (*glBlendEquation_t)(GLenum);
+typedef void  (*glBindTexture_t)(GLenum, GLuint);
+typedef void  (*glActiveTexture_t)(GLenum);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -84,8 +114,8 @@ static glDisable_t            orig_glDisable            = nullptr;
 static glBlendFunc_t          orig_glBlendFunc          = nullptr;
 static glDrawElements_t       orig_glDrawElements       = nullptr;
 static glDrawArrays_t         orig_glDrawArrays         = nullptr;
-static glColorMask_t          orig_glColorMask          = nullptr;
-static glBlendEquation_t      orig_glBlendEquation      = nullptr;
+static glBindTexture_t        orig_glBindTexture        = nullptr;
+static glActiveTexture_t      orig_glActiveTexture      = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint g_current_program       = 0;
@@ -94,8 +124,7 @@ static GLint  g_materialAmbient_loc   = -2;
 static int    g_is_ped_program        = 0;
 static int    g_blend_currently_on    = 0;
 static int    g_we_overrode_color     = 0;
-static int    g_log_draw_count        = 0;
-static int    g_seen_ped_once         = 0; // trigger trace window sekali
+static int    g_active_texture_unit   = GL_TEXTURE0;
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void _enable(void)  { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
@@ -109,24 +138,20 @@ static void _get_color(float* out) {
     out[0] = g_color[0]; out[1] = g_color[1];
     out[2] = g_color[2]; out[3] = g_color[3];
 }
-static void _set_block_blend(int v) {
-    g_block_blend = v ? 1 : 0;
-    logff_("[SOLIDSKIN] block_blend set: %d", g_block_blend);
-}
-static int _get_block_blend(void) { return g_block_blend; }
-static void _set_force_blendfunc(int v) {
-    g_force_blendfunc = v ? 1 : 0;
-    logff_("[SOLIDSKIN] force_blendfunc set: %d", g_force_blendfunc);
-}
-static int _get_force_blendfunc(void) { return g_force_blendfunc; }
-// Re-arm trace window secara manual dari Lua kalau perlu re-capture.
+static void _set_block_blend(int v) { g_block_blend = v ? 1 : 0; }
+static int  _get_block_blend(void) { return g_block_blend; }
+static void _set_force_blendfunc(int v) { g_force_blendfunc = v ? 1 : 0; }
+static int  _get_force_blendfunc(void) { return g_force_blendfunc; }
 static void _rearm_trace(void) {
-    g_trace_active = 1;
-    g_trace_remaining = TRACE_BUDGET;
-    logf_("[TRACE] === trace window di-rearm manual ===");
+    g_trace_done_once = 0;
+    g_trace_active = 0;
+    g_trace_remaining = 0;
+    g_ring_pos = 0;
+    g_ring_count = 0;
+    logf_("[TRACE] === di-rearm manual, siap trigger ulang ===");
 }
 
-// ─── Helper: paksa state non-transparan untuk program saat ini ──────────────
+// ─── Helper: paksa state non-transparan ─────────────────────────────────────
 static inline void force_opaque_state(void) {
     if (g_blend_currently_on) {
         orig_glDisable(GL_BLEND);
@@ -136,13 +161,24 @@ static inline void force_opaque_state(void) {
     }
 }
 
+// ─── Hook: glActiveTexture / glBindTexture (untuk lihat texture ped) ────────
+static void hook_glActiveTexture(GLenum texture) {
+    g_active_texture_unit = texture;
+    trace_log("glActiveTexture(unit=%d)", texture - GL_TEXTURE0);
+    orig_glActiveTexture(texture);
+}
+
+static void hook_glBindTexture(GLenum target, GLuint texture) {
+    trace_log("glBindTexture(unit=%d, tex_id=%u) is_ped=%d",
+              g_active_texture_unit - GL_TEXTURE0, texture, g_is_ped_program);
+    orig_glBindTexture(target, texture);
+}
+
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
-    if (g_trace_active) {
-        trace_log("glUseProgram(%u)", program);
-    }
-
     if (program != g_current_program) {
+        trace_log("glUseProgram(%u)", program);
+
         g_current_program = program;
         g_we_overrode_color = 0;
 
@@ -156,17 +192,6 @@ static void hook_glUseProgram(GLuint program) {
                 g_materialDiffuse_loc = it->second.diffuse_loc;
                 g_materialAmbient_loc = it->second.ambient_loc;
                 g_is_ped_program      = it->second.is_ped;
-
-                // Kalau program ini sudah dikenal sebagai ped dan trace belum
-                // pernah jalan sama sekali di seluruh run, mulai sekarang —
-                // ini menangkap pengulangan program ped yg sudah di-cache.
-                if (g_is_ped_program && !g_seen_ped_once) {
-                    g_seen_ped_once = 1;
-                    g_trace_active = 1;
-                    g_trace_remaining = TRACE_BUDGET;
-                    logff_("[TRACE] === mulai trace window (cached ped prog=%u) ===", program);
-                    trace_log("glUseProgram(%u) [ped, from cache]", program);
-                }
             } else {
                 g_materialDiffuse_loc = -2;
                 g_materialAmbient_loc = -2;
@@ -183,13 +208,11 @@ static void hook_glUseProgram(GLuint program) {
 
 // ─── Hook: glEnable / glDisable ──────────────────────────────────────────────
 static void hook_glEnable(GLenum cap) {
-    if (g_trace_active && cap == GL_BLEND) {
-        trace_log("glEnable(GL_BLEND) is_ped=%d", g_is_ped_program);
-    }
     if (cap == GL_BLEND) {
+        trace_log("glEnable(GL_BLEND) is_ped=%d", g_is_ped_program);
         g_blend_currently_on = 1;
         if (g_enabled && g_block_blend && g_is_ped_program) {
-            if (g_trace_active) trace_log("  -> TELAN (block_blend aktif)");
+            trace_log("  -> TELAN");
             return;
         }
     }
@@ -197,10 +220,8 @@ static void hook_glEnable(GLenum cap) {
 }
 
 static void hook_glDisable(GLenum cap) {
-    if (g_trace_active && cap == GL_BLEND) {
-        trace_log("glDisable(GL_BLEND) is_ped=%d", g_is_ped_program);
-    }
     if (cap == GL_BLEND) {
+        trace_log("glDisable(GL_BLEND) is_ped=%d", g_is_ped_program);
         g_blend_currently_on = 0;
     }
     orig_glDisable(cap);
@@ -221,48 +242,27 @@ static const char* blend_factor_name(GLenum f) {
     }
 }
 static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
-    if (g_trace_active) {
-        trace_log("glBlendFunc(%s, %s) is_ped=%d",
-                  blend_factor_name(sfactor), blend_factor_name(dfactor), g_is_ped_program);
-    }
+    trace_log("glBlendFunc(%s, %s) is_ped=%d",
+              blend_factor_name(sfactor), blend_factor_name(dfactor), g_is_ped_program);
     if (g_enabled && g_force_blendfunc && g_is_ped_program) {
-        if (g_trace_active) trace_log("  -> OVERRIDE jadi (ONE, ZERO)");
+        trace_log("  -> OVERRIDE jadi (ONE, ZERO)");
         orig_glBlendFunc(GL_ONE, GL_ZERO);
         return;
     }
     orig_glBlendFunc(sfactor, dfactor);
 }
 
-// ─── Hook: glBlendEquation (jaga-jaga kalau game pakai GL_FUNC_ADD vs lain) ─
-static void hook_glBlendEquation(GLenum mode) {
-    if (g_trace_active) {
-        trace_log("glBlendEquation(%u) is_ped=%d", (unsigned)mode, g_is_ped_program);
-    }
-    orig_glBlendEquation(mode);
-}
-
-// ─── Hook: glColorMask (cek apakah alpha channel write dimatikan game) ──────
-static void hook_glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
-    if (g_trace_active) {
-        trace_log("glColorMask(r=%d g=%d b=%d a=%d) is_ped=%d", r, g, b, a, g_is_ped_program);
-    }
-    orig_glColorMask(r, g, b, a);
-}
-
 // ─── Hook: glDrawElements / glDrawArrays ────────────────────────────────────
 static inline void pre_draw_check(const char* which) {
-    if (g_trace_active) {
-        trace_log("%s() prog=%u is_ped=%d blend_on=%d overrode=%d",
-                  which, g_current_program, g_is_ped_program, g_blend_currently_on, g_we_overrode_color);
-    }
+    trace_log("%s() prog=%u is_ped=%d blend_on=%d overrode=%d",
+              which, g_current_program, g_is_ped_program, g_blend_currently_on, g_we_overrode_color);
+
     if (g_enabled && g_is_ped_program && g_we_overrode_color) {
         if (g_block_blend || g_force_blendfunc) {
             force_opaque_state();
         }
-        if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d", g_current_program, g_blend_currently_on);
-            g_log_draw_count++;
-        }
+        // INI TRIGGER UTAMA: draw call pertama untuk ped yg sudah di-override.
+        maybe_trigger_trace("draw call pertama utk ped yg sudah di-override warna");
     }
 }
 
@@ -290,7 +290,6 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
         return;
     }
 
-    // Lazy resolve — hanya sekali per program, lalu masuk cache
     if (g_materialDiffuse_loc == -2) {
         GLint d = orig_glGetUniformLocation(g_current_program, "MaterialDiffuse");
         GLint a = orig_glGetUniformLocation(g_current_program, "MaterialAmbient");
@@ -306,24 +305,13 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
         logff_("[SOLIDSKIN] resolve prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
                g_current_program, d, a, b, is_ped);
 
-        // Pertama kali ketemu ped program SAMA SEKALI di seluruh run -> mulai trace.
-        if (is_ped && !g_seen_ped_once) {
-            g_seen_ped_once = 1;
-            g_trace_active = 1;
-            g_trace_remaining = TRACE_BUDGET;
-            logff_("[TRACE] === mulai trace window (fresh resolve ped prog=%u) ===", g_current_program);
-            trace_log("glUniform4fv resolve selesai, prog=%u [ped baru]", g_current_program);
-        }
-
         if (g_enabled && g_block_blend && g_is_ped_program) {
             force_opaque_state();
         }
     }
 
-    if (g_trace_active && g_is_ped_program) {
-        trace_log("glUniform4fv(loc=%d) prog=%u diffuse_loc=%d ambient_loc=%d",
-                  location, g_current_program, g_materialDiffuse_loc, g_materialAmbient_loc);
-    }
+    trace_log("glUniform4fv(loc=%d) prog=%u is_ped=%d diffuse_loc=%d ambient_loc=%d",
+              location, g_current_program, g_is_ped_program, g_materialDiffuse_loc, g_materialAmbient_loc);
 
     if (!g_is_ped_program) {
         orig_glUniform4fv(location, count, value);
@@ -331,7 +319,7 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
     }
 
     if (location != -1 && location == g_materialDiffuse_loc) {
-        if (g_trace_active) trace_log("  -> OVERRIDE diffuse jadi warna solid");
+        trace_log("  -> OVERRIDE diffuse");
         orig_glUniform4fv(location, count, g_color);
         g_we_overrode_color = 1;
         force_opaque_state();
@@ -339,7 +327,7 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
     }
     if (location != -1 && location == g_materialAmbient_loc) {
         GLfloat ambient[4] = {g_color[0], g_color[1], g_color[2], 1.0f};
-        if (g_trace_active) trace_log("  -> OVERRIDE ambient jadi warna solid (alpha=1.0)");
+        trace_log("  -> OVERRIDE ambient (alpha=1.0)");
         orig_glUniform4fv(location, count, ambient);
         g_we_overrode_color = 1;
         force_opaque_state();
@@ -363,7 +351,6 @@ struct SolidSkinAPI {
     void (*rearm_trace)(void);
 };
 
-// ─── AML entry points ────────────────────────────────────────────────────────
 extern "C" {
 
 EXPORT SolidSkinAPI solidskin_api = {
@@ -374,13 +361,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|1.4|Solid color skin override via GL hook (no-blend, traced)|brruham";
+    static const char* info = "solidskin|1.5|Solid color skin override + full draw-triggered trace|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v1.4");
+    logf_("[SOLIDSKIN] OnModPreLoad v1.5");
     g_enabled             = 0;
     g_current_program     = 0;
     g_materialDiffuse_loc = -2;
@@ -389,12 +376,14 @@ EXPORT void OnModPreLoad() {
     g_is_ped_program      = 0;
     g_blend_currently_on  = 0;
     g_we_overrode_color   = 0;
-    g_log_draw_count      = 0;
     g_block_blend         = 1;
     g_force_blendfunc     = 1;
     g_trace_active        = 0;
-    g_trace_remaining     = 0;
-    g_seen_ped_once       = 0;
+    g_trace_remaining      = 0;
+    g_trace_done_once     = 0;
+    g_ring_pos            = 0;
+    g_ring_count          = 0;
+    g_active_texture_unit = GL_TEXTURE0;
     g_program_cache.clear();
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
 }
@@ -423,7 +412,6 @@ EXPORT void OnModLoad() {
 
     orig_glUniform4fv = (glUniform4fv_t)dlsym(hGLES2, "glUniform4fv");
     if (!orig_glUniform4fv) { logf_("[SOLIDSKIN] ERROR: glUniform4fv null"); return; }
-    logff_("[SOLIDSKIN] glUniform4fv addr = %p", (void*)orig_glUniform4fv);
     if (dobbyHook((void*)orig_glUniform4fv, (void*)hook_glUniform4fv, (void**)&orig_glUniform4fv) != 0) {
         logf_("[SOLIDSKIN] ERROR: hook glUniform4fv gagal"); return;
     }
@@ -450,30 +438,6 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glBlendFunc OK");
 
-    orig_glBlendEquation = (glBlendEquation_t)dlsym(hGLES2, "glBlendEquation");
-    if (orig_glBlendEquation) {
-        if (dobbyHook((void*)orig_glBlendEquation, (void*)hook_glBlendEquation, (void**)&orig_glBlendEquation) == 0) {
-            logf_("[SOLIDSKIN] hook glBlendEquation OK");
-        } else {
-            logf_("[SOLIDSKIN] WARNING: hook glBlendEquation gagal (lanjut tanpa trace ini)");
-            orig_glBlendEquation = nullptr;
-        }
-    } else {
-        logf_("[SOLIDSKIN] WARNING: glBlendEquation tidak ditemukan");
-    }
-
-    orig_glColorMask = (glColorMask_t)dlsym(hGLES2, "glColorMask");
-    if (orig_glColorMask) {
-        if (dobbyHook((void*)orig_glColorMask, (void*)hook_glColorMask, (void**)&orig_glColorMask) == 0) {
-            logf_("[SOLIDSKIN] hook glColorMask OK");
-        } else {
-            logf_("[SOLIDSKIN] WARNING: hook glColorMask gagal (lanjut tanpa trace ini)");
-            orig_glColorMask = nullptr;
-        }
-    } else {
-        logf_("[SOLIDSKIN] WARNING: glColorMask tidak ditemukan");
-    }
-
     orig_glDrawElements = (glDrawElements_t)dlsym(hGLES2, "glDrawElements");
     if (!orig_glDrawElements) { logf_("[SOLIDSKIN] ERROR: glDrawElements null"); return; }
     if (dobbyHook((void*)orig_glDrawElements, (void*)hook_glDrawElements, (void**)&orig_glDrawElements) != 0) {
@@ -488,11 +452,31 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glDrawArrays OK");
 
+    orig_glBindTexture = (glBindTexture_t)dlsym(hGLES2, "glBindTexture");
+    if (orig_glBindTexture) {
+        if (dobbyHook((void*)orig_glBindTexture, (void*)hook_glBindTexture, (void**)&orig_glBindTexture) == 0) {
+            logf_("[SOLIDSKIN] hook glBindTexture OK");
+        } else {
+            logf_("[SOLIDSKIN] WARNING: hook glBindTexture gagal");
+            orig_glBindTexture = nullptr;
+        }
+    }
+
+    orig_glActiveTexture = (glActiveTexture_t)dlsym(hGLES2, "glActiveTexture");
+    if (orig_glActiveTexture) {
+        if (dobbyHook((void*)orig_glActiveTexture, (void*)hook_glActiveTexture, (void**)&orig_glActiveTexture) == 0) {
+            logf_("[SOLIDSKIN] hook glActiveTexture OK");
+        } else {
+            logf_("[SOLIDSKIN] WARNING: hook glActiveTexture gagal");
+            orig_glActiveTexture = nullptr;
+        }
+    }
+
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, warna hijau, block_blend=1, force_blendfunc=1, trace siap");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, trace siap (trigger di draw call ped pertama)");
 }
 
 } // extern "C"
