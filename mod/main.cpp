@@ -168,13 +168,15 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glUseProgram OK");
 
-    // ── 5. Hook glUniform4fv via GOT offset 0x673c98 ──────────────────────
-    uintptr_t got_uniform4fv = base + 0x673c98;
-    orig_glUniform4fv = *(glUniform4fv_t*)got_uniform4fv;
+    // ── 5. Hook glUniform4fv via dlsym libGLESv2 ───────────────────────
+    void* hGLES = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!hGLES) { logf_("[SOLIDSKIN] ERROR: libGLESv2.so tidak ditemukan"); return; }
+    orig_glUniform4fv = (glUniform4fv_t)dlsym(hGLES, "glUniform4fv");
     if (!orig_glUniform4fv) {
-        logf_("[SOLIDSKIN] ERROR: glUniform4fv ptr null");
+        logf_("[SOLIDSKIN] ERROR: glUniform4fv dlsym null");
         return;
     }
+    logff_("[SOLIDSKIN] glUniform4fv addr = %p", (void*)orig_glUniform4fv);
     if (dobbyHook((void*)orig_glUniform4fv,
                   (void*)hook_glUniform4fv,
                   (void**)&orig_glUniform4fv) != 0) {
