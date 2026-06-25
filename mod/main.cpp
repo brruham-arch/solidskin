@@ -27,6 +27,7 @@ static void logff_(const char* fmt, ...) {
 // ─── State global ────────────────────────────────────────────────────────────
 static int   g_enabled = 0;
 static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f}; // hijau terang
+static int   g_block_blend = 1; // toggle untuk force-disable GL_BLEND saat ped program aktif
 
 // ─── Program cache (fix FPS drop) ────────────────────────────────────────────
 struct ProgramInfo {
@@ -40,16 +41,23 @@ static std::unordered_map<GLuint, ProgramInfo> g_program_cache;
 typedef void  (*glUniform4fv_t)(GLint, GLsizei, const GLfloat*);
 typedef void  (*glUseProgram_t)(GLuint);
 typedef GLint (*glGetUniformLocation_t)(GLuint, const char*);
+typedef void  (*glEnable_t)(GLenum);
+typedef void  (*glDisable_t)(GLenum);
+typedef void  (*glBlendFunc_t)(GLenum, GLenum);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
 static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
+static glEnable_t             orig_glEnable             = nullptr;
+static glDisable_t            orig_glDisable            = nullptr;
+static glBlendFunc_t          orig_glBlendFunc          = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint g_current_program       = 0;
 static GLint  g_materialDiffuse_loc   = -2;
 static GLint  g_materialAmbient_loc   = -2;
 static int    g_is_ped_program        = 0;
+static int    g_blend_currently_on    = 0; // tracking state asli game (bukan state nyata di GPU)
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 static void _enable(void)  { g_enabled = 1; logf_("[SOLIDSKIN] enabled"); }
@@ -63,6 +71,11 @@ static void _get_color(float* out) {
     out[0] = g_color[0]; out[1] = g_color[1];
     out[2] = g_color[2]; out[3] = g_color[3];
 }
+static void _set_block_blend(int v) {
+    g_block_blend = v ? 1 : 0;
+    logff_("[SOLIDSKIN] block_blend set: %d", g_block_blend);
+}
+static int _get_block_blend(void) { return g_block_blend; }
 
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
@@ -87,8 +100,36 @@ static void hook_glUseProgram(GLuint program) {
                 g_is_ped_program      = 0;
             }
         }
+
+        // Setiap kali program berganti, re-evaluasi apakah blend harus
+        // dipaksa off berdasarkan state blend yang diminta game sebelumnya.
+        if (g_enabled && g_block_blend && g_is_ped_program && g_blend_currently_on) {
+            orig_glDisable(GL_BLEND);
+        } else if (g_blend_currently_on) {
+            orig_glEnable(GL_BLEND);
+        }
     }
     orig_glUseProgram(program);
+}
+
+// ─── Hook: glEnable / glDisable (untuk blokir GL_BLEND di ped program) ───────
+static void hook_glEnable(GLenum cap) {
+    if (cap == GL_BLEND) {
+        g_blend_currently_on = 1;
+        if (g_enabled && g_block_blend && g_is_ped_program) {
+            // Jangan benar-benar enable blend — supaya alpha output solid 1.0
+            // tidak ke-blend dengan background / texture alpha cutout.
+            return;
+        }
+    }
+    orig_glEnable(cap);
+}
+
+static void hook_glDisable(GLenum cap) {
+    if (cap == GL_BLEND) {
+        g_blend_currently_on = 0;
+    }
+    orig_glDisable(cap);
 }
 
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
@@ -120,6 +161,11 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
 
         logff_("[SOLIDSKIN] resolve prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
                g_current_program, d, a, b, is_ped);
+
+        // Program baru terdeteksi sebagai ped DAN blend lagi nyala -> matikan sekarang.
+        if (g_enabled && g_block_blend && g_is_ped_program && g_blend_currently_on) {
+            orig_glDisable(GL_BLEND);
+        }
     }
 
     if (!g_is_ped_program) {
@@ -148,29 +194,34 @@ struct SolidSkinAPI {
     int  (*is_enabled)(void);
     void (*set_color)(float r, float g, float b, float a);
     void (*get_color)(float* out);
+    void (*set_block_blend)(int v);
+    int  (*get_block_blend)(void);
 };
 
 // ─── AML entry points ────────────────────────────────────────────────────────
 extern "C" {
 
 EXPORT SolidSkinAPI solidskin_api = {
-    _enable, _disable, _is_enabled, _set_color, _get_color
+    _enable, _disable, _is_enabled, _set_color, _get_color,
+    _set_block_blend, _get_block_blend
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|1.1|Solid color skin override via GL hook|brruham";
+    static const char* info = "solidskin|1.2|Solid color skin override via GL hook (no-blend)|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v1.1");
+    logf_("[SOLIDSKIN] OnModPreLoad v1.2");
     g_enabled             = 0;
     g_current_program     = 0;
     g_materialDiffuse_loc = -2;
     g_materialAmbient_loc = -2;
     g_hook_call_count     = 0;
     g_is_ped_program      = 0;
+    g_blend_currently_on  = 0;
+    g_block_blend         = 1;
     g_program_cache.clear();
     // Hijau terang, full opaque
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
@@ -221,12 +272,36 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glUniform4fv OK");
 
-    // 6. Tulis alamat API untuk Lua
+    // 6. Hook glEnable (untuk blok GL_BLEND saat ped program)
+    orig_glEnable = (glEnable_t)dlsym(hGLES2, "glEnable");
+    if (!orig_glEnable) {
+        logf_("[SOLIDSKIN] ERROR: glEnable null"); return;
+    }
+    if (dobbyHook((void*)orig_glEnable,
+                  (void*)hook_glEnable,
+                  (void**)&orig_glEnable) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glEnable gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glEnable OK");
+
+    // 7. Hook glDisable (untuk tracking state blend asli game)
+    orig_glDisable = (glDisable_t)dlsym(hGLES2, "glDisable");
+    if (!orig_glDisable) {
+        logf_("[SOLIDSKIN] ERROR: glDisable null"); return;
+    }
+    if (dobbyHook((void*)orig_glDisable,
+                  (void*)hook_glDisable,
+                  (void**)&orig_glDisable) != 0) {
+        logf_("[SOLIDSKIN] ERROR: hook glDisable gagal"); return;
+    }
+    logf_("[SOLIDSKIN] hook glDisable OK");
+
+    // 8. Tulis alamat API untuk Lua
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, warna hijau");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, warna hijau, block_blend=1");
 }
 
 } // extern "C"
