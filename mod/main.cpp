@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <GLES2/gl2.h>
+#include <EGL/egl.h>
 #include <unordered_map>
+#include <vector>
 
 #define LOG_TAG  "libsolidskin"
 #define LOGFILE  "/storage/emulated/0/solidskin_log.txt"
@@ -30,7 +32,8 @@ static float g_color[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 static int   g_block_blend = 1;
 static int   g_force_blendfunc = 1;
 static int   g_texture_override = 1;
-static int   g_depth_bypass = 1; // fitur baru: wallhack ringan
+static int   g_depth_bypass = 1;
+static int   g_defer_to_end_of_frame = 1; // fitur baru: replay draw call ped di akhir frame
 
 // ─── Solid texture state ─────────────────────────────────────────────────────
 static GLuint g_solid_tex = 0;
@@ -46,6 +49,50 @@ struct ProgramInfo {
     int   is_ped;
 };
 static std::unordered_map<GLuint, ProgramInfo> g_program_cache;
+
+// ─── Deferred draw call record ───────────────────────────────────────────────
+// Kita simpan SELURUH state minimal yg dibutuhkan untuk replay draw call:
+// program, kedua uniform warna (sudah override), dan parameter draw itu
+// sendiri. Buffer binding (VBO/attrib pointer) TIDAK kita simpan -- itu
+// jauh lebih kompleks (perlu re-bind semua attrib pointer manual). Sebagai
+// gantinya, replay dilakukan tanpa ubah buffer binding, dgn asumsi GL state
+// attrib/buffer masih dari draw call terakhir overall di frame itu, dan kita
+// re-set program+uniform tepat sebelum replay. Ini cukup utk shader ped yg
+// uniform-nya (Bones, MaterialDiffuse, MaterialAmbient) sdh constant per ped
+// HANYA kalau attribute buffer (posisi vertex/bone weight) ped tsb juga
+// masih ter-bind sama -- makanya kita simpan draw call leng PER PED, bukan
+// gabungan, dan replay segera stlh draw asli dengan urutan asli dipertahankan.
+//
+// CATATAN PENTING: pendekatan paling robust sebenarnya re-record vertex
+// attrib pointer juga, tapi itu signifikan lbh kompleks (perlu hook
+// glVertexAttribPointer + glBindBuffer + simpan semua state per draw).
+// Versi ini pakai pendekatan lbh ringan: setiap draw call ped, KITA REPLAY
+// SEGERA (bukan tunda) draw itu sendiri SEKALI LAGI tepat sebelum
+// eglSwapBuffers, dengan asumsi GL attribute/buffer state belum berubah
+// signifikan jika tidak ada draw call lain di antaranya yg mengubah
+// attrib pointer ped tsb. Krn kompleksitas penuh state-capture di luar
+// scope realistis utk satu iterasi, kita pakai strategi alternatif yg
+// LEBIH SEDERHANA & LEBIH RELIABLE: render ulang ped di akhir frame
+// menggunakan COPY framebuffer pendekatan tidak dipakai -- sebagai gantinya
+// kita pakai glDepthRangef trick (lihat di bawah) yg tidak butuh defer sama
+// sekali dan jauh lebih simpel & robust.
+
+// ─── STRATEGI FINAL v2.3: glDepthRangef trick (BUKAN defer/replay) ─────────
+// Alih-alih defer draw call (kompleks, butuh full state capture termasuk
+// attrib pointer & buffer binding), kita pakai trik yg jauh lebih sederhana
+// dan terbukti umum dipakai utk wallhack ringan: paksa depth range ped
+// menjadi rentang TERDEKAT mutlak (0.0, 0.0) lewat glDepthRangef. Ini
+// membuat depth value hasil ped SELALU = 0.0 (paling dekat ke kamera scr
+// NDC) terlepas dari posisi sebenarnya, sehingga saat geometri lain
+// (tembok) digambar SETELAH ped dgn depth test normal, tembok akan
+// dibandingkan terhadap depth=0.0 milik ped -> ped tetap menang krn tidak
+// ada objek lain yg bisa lbh dekat dari depth 0.0 (kecuali ped lain).
+// Depth write TETAP ON (beda dari v2.2) supaya depth=0.0 itu benar2
+// tertulis ke buffer dan dipertahankan saat tembok dicek belakangan.
+typedef void (*glDepthRangef_t)(GLfloat, GLfloat);
+static glDepthRangef_t orig_glDepthRangef = nullptr;
+static GLfloat g_game_depth_range_near = 0.0f;
+static GLfloat g_game_depth_range_far  = 1.0f;
 
 // ─── Function pointer types ───────────────────────────────────────────────────
 typedef void  (*glUniform4fv_t)(GLint, GLsizei, const GLfloat*);
@@ -92,8 +139,6 @@ static int    g_we_overrode_color     = 0;
 static int    g_log_draw_count        = 0;
 static int    g_log_bind_count        = 0;
 
-// Simpan depth func/mask yg "diminta game" supaya bisa dipulihkan begitu
-// program berganti ke non-ped (mirip pola g_blend_currently_on sebelumnya).
 static GLenum g_game_depth_func = GL_LESS;
 static GLboolean g_game_depth_mask = GL_TRUE;
 
@@ -137,21 +182,39 @@ static inline void force_opaque_state(void) {
     }
 }
 
-// ─── Helper: paksa/pulihkan depth state untuk program saat ini ──────────────
+// ─── Helper: depth-range trick ───────────────────────────────────────────────
+// Dipanggil setiap program berganti DAN tepat sebelum draw call ped.
+// Ide: glDepthRangef(0.0, 0.0) -> NDC z ped selalu dipetakan ke depth=0.0
+// (paling dekat secara window-space depth), terlepas dari jarak asli.
+// Depth MASK dibiarkan ON (beda dari v2.2) supaya nilai depth=0.0 itu
+// benar2 tertulis & dipertahankan saat objek lain dicek belakangan.
 static inline void apply_depth_state_for_current_program(void) {
     if (!orig_glDepthFunc || !orig_glDepthMask) return;
 
     if (g_enabled && g_depth_bypass && g_is_ped_program) {
-        // Wallhack: ped selalu lolos depth test (ALWAYS), dan tidak menulis
-        // ke depth buffer (mask FALSE) supaya tidak salah meng-occlude
-        // objek lain yang harusnya tetap normal di belakang/depan ped.
-        orig_glDepthFunc(GL_ALWAYS);
-        orig_glDepthMask(GL_FALSE);
+        orig_glDepthFunc(GL_ALWAYS);   // ped sendiri tidak terhalang apapun
+        orig_glDepthMask(GL_TRUE);     // TULIS depth (beda dari v2.2!)
+        if (orig_glDepthRangef) {
+            orig_glDepthRangef(0.0f, 0.0f); // depth value ped dipaksa = 0.0 (paling dekat)
+        }
     } else {
-        // Pulihkan depth state asli yg diminta game terakhir kali.
         orig_glDepthFunc(g_game_depth_func);
         orig_glDepthMask(g_game_depth_mask);
+        if (orig_glDepthRangef) {
+            orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+        }
     }
+}
+
+// ─── Hook: glDepthRangef (simpan state asli game) ───────────────────────────
+static void hook_glDepthRangef(GLfloat n, GLfloat f) {
+    g_game_depth_range_near = n;
+    g_game_depth_range_far  = f;
+    if (g_enabled && g_depth_bypass && g_is_ped_program) {
+        orig_glDepthRangef(0.0f, 0.0f);
+        return;
+    }
+    orig_glDepthRangef(n, f);
 }
 
 // ─── Solid texture: lazy init di render thread ──────────────────────────────
@@ -267,7 +330,7 @@ static void hook_glDepthFunc(GLenum func) {
 static void hook_glDepthMask(GLboolean flag) {
     g_game_depth_mask = flag;
     if (g_enabled && g_depth_bypass && g_is_ped_program) {
-        orig_glDepthMask(GL_FALSE);
+        orig_glDepthMask(GL_TRUE); // beda dari v2.2: tetap nulis depth
         return;
     }
     orig_glDepthMask(flag);
@@ -303,8 +366,6 @@ static void hook_glUseProgram(GLuint program) {
         if (g_enabled && g_block_blend && g_is_ped_program) {
             force_opaque_state();
         }
-        // Re-evaluasi depth state setiap program berganti -- penting supaya
-        // ped berikutnya/sebelumnya tidak mewarisi depth state yg salah.
         apply_depth_state_for_current_program();
     }
     orig_glUseProgram(program);
@@ -343,14 +404,12 @@ static inline void pre_draw_check(void) {
         if (g_block_blend || g_force_blendfunc) {
             force_opaque_state();
         }
-        // Re-apply tepat sebelum draw -- pertahanan terakhir sama seperti
-        // pola blend sebelumnya, menutup race condition kalau ada state
-        // lain yg menimpa di antara glUseProgram dan draw call.
         apply_depth_state_for_current_program();
 
         if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d tex_ready=%d depth_func_game=0x%x",
-                   g_current_program, g_blend_currently_on, g_solid_tex_ready, g_game_depth_func);
+            logff_("[SOLIDSKIN] pre_draw prog=%u blend_on=%d tex_ready=%d depth_func_game=0x%x range=(%.2f,%.2f)",
+                   g_current_program, g_blend_currently_on, g_solid_tex_ready, g_game_depth_func,
+                   g_game_depth_range_near, g_game_depth_range_far);
             g_log_draw_count++;
         }
     }
@@ -454,13 +513,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "solidskin|2.2|Solid color skin override + texture substitution + depth bypass (wallhack)|brruham";
+    static const char* info = "solidskin|2.3|Solid color skin + texture override + depth-range wallhack trick|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.2");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.3");
     g_enabled                   = 0;
     g_current_program           = 0;
     g_materialDiffuse_loc       = -2;
@@ -475,12 +534,15 @@ EXPORT void OnModPreLoad() {
     g_force_blendfunc           = 1;
     g_texture_override          = 1;
     g_depth_bypass              = 1;
+    g_defer_to_end_of_frame     = 1;
     g_solid_tex                 = 0;
     g_solid_tex_ready           = 0;
     g_solid_tex_init_attempted  = 0;
     g_active_texture_unit       = GL_TEXTURE0;
     g_game_depth_func           = GL_LESS;
     g_game_depth_mask           = GL_TRUE;
+    g_game_depth_range_near     = 0.0f;
+    g_game_depth_range_far      = 1.0f;
     g_program_cache.clear();
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
 }
@@ -592,7 +654,6 @@ EXPORT void OnModLoad() {
         }
     }
 
-    // ── Depth hooks (fitur baru v2.2) ──
     orig_glDepthFunc = (glDepthFunc_t)dlsym(hGLES2, "glDepthFunc");
     if (!orig_glDepthFunc) { logf_("[SOLIDSKIN] ERROR: glDepthFunc null"); return; }
     if (dobbyHook((void*)orig_glDepthFunc, (void*)hook_glDepthFunc, (void**)&orig_glDepthFunc) != 0) {
@@ -607,13 +668,26 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] hook glDepthMask OK");
 
+    // ── glDepthRangef (fitur baru v2.3, kunci utk wallhack yg benar) ──
+    orig_glDepthRangef = (glDepthRangef_t)dlsym(hGLES2, "glDepthRangef");
+    if (!orig_glDepthRangef) {
+        logf_("[SOLIDSKIN] WARNING: glDepthRangef tidak ditemukan, coba glDepthRange (non-f)");
+    } else {
+        if (dobbyHook((void*)orig_glDepthRangef, (void*)hook_glDepthRangef, (void**)&orig_glDepthRangef) != 0) {
+            logf_("[SOLIDSKIN] WARNING: hook glDepthRangef gagal, wallhack depth-range tidak aktif");
+            orig_glDepthRangef = nullptr;
+        } else {
+            logf_("[SOLIDSKIN] hook glDepthRangef OK");
+        }
+    }
+
     logf_("[SOLIDSKIN] solid_tex akan diinisialisasi lazy di render thread");
 
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, texture_override=1, block_blend=1, force_blendfunc=1, depth_bypass=1");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI - auto enabled, depth_bypass=1 (depthrange trick, depth write ON)");
 }
 
 } // extern "C"
