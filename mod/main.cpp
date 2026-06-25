@@ -294,13 +294,27 @@ static void hook_glUseProgram(GLuint program) {
         } else {
             auto it = g_program_cache.find(program);
             if (it != g_program_cache.end()) {
+                // Sudah di cache, langsung pakai
                 g_materialDiffuse_loc = it->second.diffuse_loc;
                 g_materialAmbient_loc = it->second.ambient_loc;
                 g_is_ped_program      = it->second.is_ped;
             } else {
-                g_materialDiffuse_loc = -2;
-                g_materialAmbient_loc = -2;
-                g_is_ped_program      = 0;
+                // Belum di cache — resolve SEKARANG, jangan tunggu glUniform4fv.
+                // Game sering cache uniform antar frame, jadi glUniform4fv
+                // tidak selalu dipanggil lagi untuk program yang sudah aktif.
+                GLint d = orig_glGetUniformLocation(program, "MaterialDiffuse");
+                GLint a = orig_glGetUniformLocation(program, "MaterialAmbient");
+                GLint b = orig_glGetUniformLocation(program, "Bones");
+                int is_ped = (b != -1) ? 1 : 0;
+
+                g_materialDiffuse_loc = d;
+                g_materialAmbient_loc = a;
+                g_is_ped_program      = is_ped;
+
+                g_program_cache[program] = {d, a, is_ped};
+
+                logff_("[SOLIDSKIN] resolve(UseProgram) prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
+                       program, d, a, b, is_ped);
             }
         }
 
@@ -540,13 +554,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.5|Two-pass wallhack fix: kuning=behind wall hijau=visible, no uniform cache miss|brruham";
+        "solidskin|2.6|Two-pass wallhack: resolve uniform di UseProgram fix draw call miss|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.5 (two-pass fix: no uniform cache miss)");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.6 (resolve uniform di UseProgram, bukan di Uniform4fv)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -580,7 +594,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.5 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v2.6 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -648,8 +662,8 @@ EXPORT void OnModLoad() {
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.5 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix: two-pass tanpa tunggu uniform)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.6 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix v2.6: resolve uniform di UseProgram)");
 }
 
 } // extern "C"
