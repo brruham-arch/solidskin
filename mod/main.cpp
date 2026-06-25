@@ -159,11 +159,10 @@ EXPORT void OnModLoad() {
     }
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
 
-    // ── 4. Hook glUseProgram via GOT offset 0x67468c ──────────────────────
-    uintptr_t got_useProgram = base + 0x67468c;
-    orig_glUseProgram = *(glUseProgram_t*)got_useProgram;
+    // ── 4. Hook glUseProgram via dlsym libGLESv2 ───────────────────────────
+    orig_glUseProgram = (glUseProgram_t)dlsym(hGLES2, "glUseProgram");
     if (!orig_glUseProgram) {
-        logf_("[SOLIDSKIN] ERROR: glUseProgram ptr null");
+        logf_("[SOLIDSKIN] ERROR: glUseProgram dlsym null");
         return;
     }
     if (dobbyHook((void*)orig_glUseProgram,
