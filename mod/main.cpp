@@ -750,13 +750,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.9diag2|Diagnostik: eglGetProcAddress + trace prog 149 draw call|brruham";
+        "solidskin|3.0|Two-pass wallhack: hook GLES2+GLES3 draw functions|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.9diag2 (+ eglGetProcAddress hook + trace prog 149)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.0 (hook draw dari libGLESv3.so - fix GLES3 path)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -793,7 +793,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.9diag2 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.0 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -881,18 +881,42 @@ EXPORT void OnModLoad() {
         logf_("[SOLIDSKIN] WARNING: libEGL.so tidak ditemukan");
     }
 
-    // ── Coba load draw func dari libGLESv3.so juga ───────────────────────
+    // ── Hook draw functions dari libGLESv3.so (KUNCI: pointer berbeda!) ────
+    // Log v2.9 konfirmasi gles2 != gles3 draw pointer, sehingga hook
+    // libGLESv2 tidak kena untuk ped yang render via GLES3 path.
     void* hGLES3 = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
     if (hGLES3) {
-        logf_("[SOLIDSKIN] INFO: libGLESv3.so ditemukan");
-        // Cek apakah draw func ada di sini dan berbeda dari libGLESv2
-        void* gles3_drawArrays = dlsym(hGLES3, "glDrawArrays");
-        void* gles2_drawArrays = (void*)orig_glDrawArrays; // sudah di-hook, ambil dari ptr asli
-        logff_("[SOLIDSKIN] glDrawArrays: gles2=%p gles3=%p same=%d",
-               gles2_drawArrays, gles3_drawArrays,
-               gles2_drawArrays == gles3_drawArrays ? 1 : 0);
+        logf_("[SOLIDSKIN] libGLESv3.so ditemukan, hook draw functions...");
+
+        // Macro: hook dari GLES3 jika pointer-nya berbeda dari yang sudah di-hook GLES2
+        #define HOOK_GLES3(name) do { \
+            void* _p3 = dlsym(hGLES3, #name); \
+            if (_p3 && _p3 != (void*)orig_##name) { \
+                void* _orig3 = _p3; \
+                if (dobbyHook(_p3, (void*)hook_##name, (void**)&_orig3) == 0) { \
+                    logf_("[SOLIDSKIN] hook GLES3 " #name " OK (ptr berbeda)"); \
+                } else { \
+                    logf_("[SOLIDSKIN] WARNING: hook GLES3 " #name " gagal"); \
+                } \
+            } else if (_p3) { \
+                logf_("[SOLIDSKIN] GLES3 " #name " ptr sama dg GLES2, skip"); \
+            } else { \
+                logf_("[SOLIDSKIN] WARNING: GLES3 " #name " tidak ada"); \
+            } \
+        } while(0)
+
+        HOOK_GLES3(glDrawArrays);
+        HOOK_GLES3(glDrawElements);
+        HOOK_GLES3(glDrawArraysInstanced);
+        HOOK_GLES3(glDrawElementsInstanced);
+        HOOK_GLES3(glDrawRangeElements);
+        HOOK_GLES3(glDrawArraysIndirect);
+        HOOK_GLES3(glDrawElementsIndirect);
+        HOOK_GLES3(glDrawElementsBaseVertex);
+
+        #undef HOOK_GLES3
     } else {
-        logf_("[SOLIDSKIN] INFO: libGLESv3.so tidak ada (normal)");
+        logf_("[SOLIDSKIN] INFO: libGLESv3.so tidak ada");
     }
 
     // Tulis alamat API utk Lua/AML consumer
@@ -900,8 +924,8 @@ EXPORT void OnModLoad() {
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.9diag2 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v2.9diag2: eglGetProcAddress + trace prog 149)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.0 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.0: GLES2+GLES3 draw hook aktif)");
 }
 
 } // extern "C"
