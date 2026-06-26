@@ -73,6 +73,8 @@ typedef GLenum (*glGetError_t)(void);
 typedef void  (*glDepthFunc_t)(GLenum);
 typedef void  (*glDepthMask_t)(GLboolean);
 typedef void  (*glDepthRangef_t)(GLfloat, GLfloat);
+typedef void  (*glDrawArraysInstanced_t)(GLenum, GLint, GLsizei, GLsizei);
+typedef void  (*glDrawElementsInstanced_t)(GLenum, GLsizei, GLenum, const void*, GLsizei);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -91,6 +93,8 @@ static glGetError_t           orig_glGetError           = nullptr;
 static glDepthFunc_t          orig_glDepthFunc          = nullptr;
 static glDepthMask_t          orig_glDepthMask          = nullptr;
 static glDepthRangef_t        orig_glDepthRangef        = nullptr;
+static glDrawArraysInstanced_t  orig_glDrawArraysInstanced  = nullptr;
+static glDrawElementsInstanced_t orig_glDrawElementsInstanced = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint    g_current_program      = 0;
@@ -465,6 +469,79 @@ static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     orig_glDrawArrays(mode, first, count);
 }
 
+// ─── Hook: glDrawArraysInstanced / glDrawElementsInstanced ──────────────────
+// GTA SA Mobile pakai instanced draw untuk ped LOD / ped jauh.
+// Sama persis logikanya dengan non-instanced, hanya forward ke instanced orig.
+
+static void hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+        if (g_log_draw_count < 20) {
+            logff_("[SOLIDSKIN] DrawArraysInstanced two-pass prog=%u count=%d inst=%d",
+                   g_current_program, count, instancecount);
+            g_log_draw_count++;
+        }
+        if (g_depth_bypass) {
+            // Pass 1: KUNING - behind wall
+            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+            orig_glDepthFunc(GL_GREATER);
+            orig_glDepthMask(GL_FALSE);
+            set_uniform_color(g_color_behind);
+            orig_glDrawArraysInstanced(mode, first, count, instancecount);
+            // Pass 2: HIJAU - visible
+            if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
+            orig_glDepthFunc(GL_ALWAYS);
+            orig_glDepthMask(GL_TRUE);
+            set_uniform_color(g_color);
+            orig_glDrawArraysInstanced(mode, first, count, instancecount);
+            // Restore
+            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+            orig_glDepthFunc(g_game_depth_func);
+            orig_glDepthMask(g_game_depth_mask);
+        } else {
+            force_opaque_state();
+            set_uniform_color(g_color);
+            orig_glDrawArraysInstanced(mode, first, count, instancecount);
+        }
+        return;
+    }
+    orig_glDrawArraysInstanced(mode, first, count, instancecount);
+}
+
+static void hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
+                                          const void* indices, GLsizei instancecount) {
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+        if (g_log_draw_count < 20) {
+            logff_("[SOLIDSKIN] DrawElementsInstanced two-pass prog=%u count=%d inst=%d",
+                   g_current_program, count, instancecount);
+            g_log_draw_count++;
+        }
+        if (g_depth_bypass) {
+            // Pass 1: KUNING
+            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+            orig_glDepthFunc(GL_GREATER);
+            orig_glDepthMask(GL_FALSE);
+            set_uniform_color(g_color_behind);
+            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
+            // Pass 2: HIJAU
+            if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
+            orig_glDepthFunc(GL_ALWAYS);
+            orig_glDepthMask(GL_TRUE);
+            set_uniform_color(g_color);
+            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
+            // Restore
+            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+            orig_glDepthFunc(g_game_depth_func);
+            orig_glDepthMask(g_game_depth_mask);
+        } else {
+            force_opaque_state();
+            set_uniform_color(g_color);
+            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
+        }
+        return;
+    }
+    orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
+}
+
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
 static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* value) {
     if (g_hook_call_count < 10) {
@@ -554,13 +631,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.6|Two-pass wallhack: resolve uniform di UseProgram fix draw call miss|brruham";
+        "solidskin|2.7|Two-pass wallhack: + instanced draw hook untuk ped LOD|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.6 (resolve uniform di UseProgram, bukan di Uniform4fv)");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.7 (+ hook DrawArraysInstanced & DrawElementsInstanced)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -594,7 +671,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.6 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v2.7 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -654,6 +731,8 @@ EXPORT void OnModLoad() {
     HOOK_WARN(glTexImage2D)
     HOOK_WARN(glTexParameteri)
     HOOK_WARN(glDepthRangef)
+    HOOK_WARN(glDrawArraysInstanced)
+    HOOK_WARN(glDrawElementsInstanced)
 
     #undef HOOK_WARN
 
@@ -662,8 +741,8 @@ EXPORT void OnModLoad() {
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.6 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix v2.6: resolve uniform di UseProgram)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.7 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix v2.7: + hook instanced draw)");
 }
 
 } // extern "C"
