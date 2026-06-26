@@ -573,13 +573,53 @@ static const char* g_draw_keywords[] = {
     "Draw", "draw", nullptr
 };
 
+// Hook draw func via pointer yg dikembalikan eglGetProcAddress.
+// Game bisa saja pakai pointer ini secara langsung (disimpan di vtable/global),
+// sehingga hook kita di libGLESv2/v3 tidak kena. Kita hook pointer EGL-nya.
+static bool g_egl_hooks_applied = false;
+
+static void apply_egl_draw_hooks(void* dobbyHook_fn) {
+    if (g_egl_hooks_applied || !orig_eglGetProcAddress) return;
+    g_egl_hooks_applied = true;
+
+    auto dobbyHook = (int(*)(void*, void*, void**))dobbyHook_fn;
+
+    // Helper: hook pointer yg didapat dari eglGetProcAddress jika berbeda dari yg sudah di-hook
+    auto try_hook_egl_ptr = [&](const char* name, void* hook_fn, void** orig_ptr_slot) {
+        auto p = (void*)orig_eglGetProcAddress(name);
+        if (!p) { logff_("[SOLIDSKIN] EGL ptr %s: null", name); return; }
+        if (p == *orig_ptr_slot) { logff_("[SOLIDSKIN] EGL ptr %s: sama dg yg sudah di-hook, skip", name); return; }
+        void* saved = p;
+        if (dobbyHook(p, hook_fn, &saved) == 0) {
+            logff_("[SOLIDSKIN] hook EGL-ptr %s OK (%p)", name, p);
+        } else {
+            logff_("[SOLIDSKIN] WARNING: hook EGL-ptr %s GAGAL (%p)", name, p);
+        }
+    };
+
+    try_hook_egl_ptr("glDrawArrays",            (void*)hook_glDrawArrays,            (void**)&orig_glDrawArrays);
+    try_hook_egl_ptr("glDrawElements",           (void*)hook_glDrawElements,           (void**)&orig_glDrawElements);
+    try_hook_egl_ptr("glDrawArraysInstanced",    (void*)hook_glDrawArraysInstanced,    (void**)&orig_glDrawArraysInstanced);
+    try_hook_egl_ptr("glDrawElementsInstanced",  (void*)hook_glDrawElementsInstanced,  (void**)&orig_glDrawElementsInstanced);
+    try_hook_egl_ptr("glDrawRangeElements",      (void*)hook_glDrawRangeElements,      (void**)&orig_glDrawRangeElements);
+    try_hook_egl_ptr("glDrawArraysIndirect",     (void*)hook_glDrawArraysIndirect,     (void**)&orig_glDrawArraysIndirect);
+    try_hook_egl_ptr("glDrawElementsIndirect",   (void*)hook_glDrawElementsIndirect,   (void**)&orig_glDrawElementsIndirect);
+    try_hook_egl_ptr("glDrawElementsBaseVertex", (void*)hook_glDrawElementsBaseVertex, (void**)&orig_glDrawElementsBaseVertex);
+}
+
+// Simpan dobbyHook ptr untuk dipakai di apply_egl_draw_hooks
+static void* g_dobbyHook_fn = nullptr;
+
 static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
     auto result = orig_eglGetProcAddress(procname);
     if (procname) {
-        // Log semua proc yang mengandung kata "Draw"
         for (int i = 0; g_draw_keywords[i]; i++) {
             if (strstr(procname, g_draw_keywords[i])) {
                 logff_("[SOLIDSKIN] eglGetProcAddress: %s -> %p", procname, (void*)result);
+                // Hook EGL draw pointers saat pertama kali game minta salah satunya
+                if (!g_egl_hooks_applied && g_dobbyHook_fn) {
+                    apply_egl_draw_hooks(g_dobbyHook_fn);
+                }
                 break;
             }
         }
@@ -750,13 +790,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.0|Two-pass wallhack: hook GLES2+GLES3 draw functions|brruham";
+        "solidskin|3.1|Two-pass wallhack: hook GLES2+GLES3+EGL draw pointers|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.0 (hook draw dari libGLESv3.so - fix GLES3 path)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.1 (+ hook EGL draw pointers langsung)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -770,6 +810,7 @@ EXPORT void OnModPreLoad() {
     g_diag_count                = 0;
     g_trace_active              = 0;
     g_trace_log_count           = 0;
+    g_egl_hooks_applied         = false;
     g_log_bind_count            = 0;
     g_block_blend               = 1;
     g_force_blendfunc           = 1;
@@ -793,12 +834,13 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.0 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.1 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
     auto dobbyHook = (int(*)(void*, void*, void**))dlsym(hDobby, "DobbyHook");
     if (!dobbyHook) { logf_("[SOLIDSKIN] ERROR: DobbyHook sym tidak ada"); return; }
+    g_dobbyHook_fn = (void*)dobbyHook; // simpan untuk apply_egl_draw_hooks
 
     void* hGLES2 = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hGLES2) { logf_("[SOLIDSKIN] ERROR: libGLESv2.so tidak ada"); return; }
@@ -923,9 +965,12 @@ EXPORT void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
+    // Coba apply EGL draw hooks sekarang juga (bukan nunggu game panggil eglGetProcAddress)
+    apply_egl_draw_hooks((void*)dobbyHook);
+
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.0 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.0: GLES2+GLES3 draw hook aktif)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.1 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.1: GLES2+GLES3+EGL draw hook aktif)");
 }
 
 } // extern "C"
