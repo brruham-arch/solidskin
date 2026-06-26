@@ -579,7 +579,7 @@ static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const cha
         // Log semua proc yang mengandung kata "Draw"
         for (int i = 0; g_draw_keywords[i]; i++) {
             if (strstr(procname, g_draw_keywords[i])) {
-                logff_("[SOLIDSKIN] eglGetProcAddress("%s") -> %p", procname, (void*)result);
+                logff_("[SOLIDSKIN] eglGetProcAddress: %s -> %p", procname, (void*)result);
                 break;
             }
         }
