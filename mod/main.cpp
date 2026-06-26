@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <EGL/egl.h>
 #include <unordered_map>
 #include <vector>
@@ -81,6 +82,7 @@ typedef void  (*glMultiDrawElements_t)(GLenum, const GLsizei*, GLenum, const voi
 typedef void  (*glDrawArraysIndirect_t)(GLenum, const void*);
 typedef void  (*glDrawElementsIndirect_t)(GLenum, GLenum, const void*);
 typedef void  (*glDrawElementsBaseVertex_t)(GLenum, GLsizei, GLenum, const void*, GLint);
+typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_t)(const char*);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -107,6 +109,12 @@ static glMultiDrawElements_t      orig_glMultiDrawElements      = nullptr;
 static glDrawArraysIndirect_t     orig_glDrawArraysIndirect     = nullptr;
 static glDrawElementsIndirect_t   orig_glDrawElementsIndirect   = nullptr;
 static glDrawElementsBaseVertex_t orig_glDrawElementsBaseVertex = nullptr;
+static eglGetProcAddress_t        orig_eglGetProcAddress        = nullptr;
+
+// Flag: prog yang sedang kita trace secara aktif
+static GLuint g_trace_prog = 149; // prog ped yang tidak punya draw call
+static int    g_trace_active = 0; // 1 kalau g_trace_prog sedang aktif
+static int    g_trace_log_count = 0;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint    g_current_program      = 0;
@@ -257,8 +265,8 @@ static void hook_glBindTexture(GLenum target, GLuint texture) {
     if (g_enabled && g_texture_override && g_solid_tex_ready &&
         target == GL_TEXTURE_2D && g_is_ped_program && texture != g_solid_tex) {
         if (g_log_bind_count < 30) {
-            logff_("[SOLIDSKIN] bindTex redirect %u->%u prog=%u",
-                   texture, g_solid_tex, g_current_program);
+            logff_("[SOLIDSKIN] bindTex redirect %u->%u prog=%u trace=%d",
+                   texture, g_solid_tex, g_current_program, g_trace_active);
             g_log_bind_count++;
         }
         in_self_bind = 1;
@@ -345,6 +353,9 @@ static void hook_glUseProgram(GLuint program) {
                 orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
         }
     }
+    // Trace: tandai kalau program yang dicurigai aktif
+    g_trace_active = (g_enabled && g_is_ped_program &&
+                      g_current_program == g_trace_prog) ? 1 : 0;
     orig_glUseProgram(program);
 }
 
@@ -554,6 +565,28 @@ static void hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type
     orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 
+// ─── Hook: eglGetProcAddress (DIAGNOSTIK v2.9) ──────────────────────────────
+// Game bisa load fungsi GL lewat eglGetProcAddress, bukan dlsym.
+// Kita intercept untuk tahu fungsi draw apa yang di-load, dan
+// replace pointer-nya kalau itu adalah draw call yang kita butuhkan.
+static const char* g_draw_keywords[] = {
+    "Draw", "draw", nullptr
+};
+
+static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
+    auto result = orig_eglGetProcAddress(procname);
+    if (procname) {
+        // Log semua proc yang mengandung kata "Draw"
+        for (int i = 0; g_draw_keywords[i]; i++) {
+            if (strstr(procname, g_draw_keywords[i])) {
+                logff_("[SOLIDSKIN] eglGetProcAddress("%s") -> %p", procname, (void*)result);
+                break;
+            }
+        }
+    }
+    return result;
+}
+
 // ─── Hook: kandidat draw tambahan (DIAGNOSTIK v2.8) ─────────────────────────
 // Tujuan: cari tahu fungsi draw MANA yang dipakai prog ped yang tidak
 // terdeksi oleh glDrawArrays/Elements/Instanced. Setiap fungsi log
@@ -717,13 +750,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.8diag|Two-pass wallhack diagnostik: cari draw call ped tidak terdeteksi|brruham";
+        "solidskin|2.9diag2|Diagnostik: eglGetProcAddress + trace prog 149 draw call|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.8diag (hook semua kandidat draw + DIAG log)");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.9diag2 (+ eglGetProcAddress hook + trace prog 149)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -735,6 +768,8 @@ EXPORT void OnModPreLoad() {
     g_we_overrode_color         = 0;
     g_log_draw_count            = 0;
     g_diag_count                = 0;
+    g_trace_active              = 0;
+    g_trace_log_count           = 0;
     g_log_bind_count            = 0;
     g_block_blend               = 1;
     g_force_blendfunc           = 1;
@@ -758,7 +793,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.8diag mulai");
+    logf_("[SOLIDSKIN] OnModLoad v2.9diag2 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -829,13 +864,44 @@ EXPORT void OnModLoad() {
 
     #undef HOOK_WARN
 
+    // ── Hook eglGetProcAddress dari libEGL.so ─────────────────────────────
+    void* hEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (hEGL) {
+        orig_eglGetProcAddress = (eglGetProcAddress_t)dlsym(hEGL, "eglGetProcAddress");
+        if (orig_eglGetProcAddress) {
+            if (dobbyHook((void*)orig_eglGetProcAddress, (void*)hook_eglGetProcAddress,
+                          (void**)&orig_eglGetProcAddress) == 0) {
+                logf_("[SOLIDSKIN] hook eglGetProcAddress OK");
+            } else {
+                logf_("[SOLIDSKIN] WARNING: hook eglGetProcAddress gagal");
+                orig_eglGetProcAddress = nullptr;
+            }
+        }
+    } else {
+        logf_("[SOLIDSKIN] WARNING: libEGL.so tidak ditemukan");
+    }
+
+    // ── Coba load draw func dari libGLESv3.so juga ───────────────────────
+    void* hGLES3 = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+    if (hGLES3) {
+        logf_("[SOLIDSKIN] INFO: libGLESv3.so ditemukan");
+        // Cek apakah draw func ada di sini dan berbeda dari libGLESv2
+        void* gles3_drawArrays = dlsym(hGLES3, "glDrawArrays");
+        void* gles2_drawArrays = (void*)orig_glDrawArrays; // sudah di-hook, ambil dari ptr asli
+        logff_("[SOLIDSKIN] glDrawArrays: gles2=%p gles3=%p same=%d",
+               gles2_drawArrays, gles3_drawArrays,
+               gles2_drawArrays == gles3_drawArrays ? 1 : 0);
+    } else {
+        logf_("[SOLIDSKIN] INFO: libGLESv3.so tidak ada (normal)");
+    }
+
     // Tulis alamat API utk Lua/AML consumer
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.8diag - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v2.8diag: cari draw call ped)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.9diag2 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v2.9diag2: eglGetProcAddress + trace prog 149)");
 }
 
 } // extern "C"
