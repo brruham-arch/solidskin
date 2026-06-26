@@ -75,6 +75,12 @@ typedef void  (*glDepthMask_t)(GLboolean);
 typedef void  (*glDepthRangef_t)(GLfloat, GLfloat);
 typedef void  (*glDrawArraysInstanced_t)(GLenum, GLint, GLsizei, GLsizei);
 typedef void  (*glDrawElementsInstanced_t)(GLenum, GLsizei, GLenum, const void*, GLsizei);
+typedef void  (*glDrawRangeElements_t)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void*);
+typedef void  (*glMultiDrawArrays_t)(GLenum, const GLint*, const GLsizei*, GLsizei);
+typedef void  (*glMultiDrawElements_t)(GLenum, const GLsizei*, GLenum, const void* const*, GLsizei);
+typedef void  (*glDrawArraysIndirect_t)(GLenum, const void*);
+typedef void  (*glDrawElementsIndirect_t)(GLenum, GLenum, const void*);
+typedef void  (*glDrawElementsBaseVertex_t)(GLenum, GLsizei, GLenum, const void*, GLint);
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -93,8 +99,14 @@ static glGetError_t           orig_glGetError           = nullptr;
 static glDepthFunc_t          orig_glDepthFunc          = nullptr;
 static glDepthMask_t          orig_glDepthMask          = nullptr;
 static glDepthRangef_t        orig_glDepthRangef        = nullptr;
-static glDrawArraysInstanced_t  orig_glDrawArraysInstanced  = nullptr;
-static glDrawElementsInstanced_t orig_glDrawElementsInstanced = nullptr;
+static glDrawArraysInstanced_t   orig_glDrawArraysInstanced   = nullptr;
+static glDrawElementsInstanced_t  orig_glDrawElementsInstanced  = nullptr;
+static glDrawRangeElements_t      orig_glDrawRangeElements      = nullptr;
+static glMultiDrawArrays_t        orig_glMultiDrawArrays        = nullptr;
+static glMultiDrawElements_t      orig_glMultiDrawElements      = nullptr;
+static glDrawArraysIndirect_t     orig_glDrawArraysIndirect     = nullptr;
+static glDrawElementsIndirect_t   orig_glDrawElementsIndirect   = nullptr;
+static glDrawElementsBaseVertex_t orig_glDrawElementsBaseVertex = nullptr;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint    g_current_program      = 0;
@@ -542,6 +554,80 @@ static void hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type
     orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 
+// ─── Hook: kandidat draw tambahan (DIAGNOSTIK v2.8) ─────────────────────────
+// Tujuan: cari tahu fungsi draw MANA yang dipakai prog ped yang tidak
+// terdeksi oleh glDrawArrays/Elements/Instanced. Setiap fungsi log
+// prog+is_ped agar kita tahu persis mana yang terpanggil.
+
+static int g_diag_count = 0;
+
+#define DIAG_LOG(fname) \
+    if (g_is_ped_program && g_diag_count < 40) { \
+        logff_("[SOLIDSKIN] DIAG " fname " prog=%u is_ped=%d diffuse=%d", \
+               g_current_program, g_is_ped_program, g_materialDiffuse_loc); \
+        g_diag_count++; \
+    }
+
+static void hook_glDrawRangeElements(GLenum mode, GLuint start, GLuint end,
+                                      GLsizei count, GLenum type, const void* indices) {
+    DIAG_LOG("glDrawRangeElements")
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0 && g_depth_bypass) {
+        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+        orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
+        set_uniform_color(g_color_behind);
+        orig_glDrawRangeElements(mode, start, end, count, type, indices);
+        if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
+        orig_glDepthFunc(GL_ALWAYS); orig_glDepthMask(GL_TRUE);
+        set_uniform_color(g_color);
+        orig_glDrawRangeElements(mode, start, end, count, type, indices);
+        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+        orig_glDepthFunc(g_game_depth_func); orig_glDepthMask(g_game_depth_mask);
+        return;
+    }
+    orig_glDrawRangeElements(mode, start, end, count, type, indices);
+}
+
+static void hook_glMultiDrawArrays(GLenum mode, const GLint* first,
+                                    const GLsizei* count, GLsizei drawcount) {
+    DIAG_LOG("glMultiDrawArrays")
+    orig_glMultiDrawArrays(mode, first, count, drawcount);
+}
+
+static void hook_glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
+                                      const void* const* indices, GLsizei drawcount) {
+    DIAG_LOG("glMultiDrawElements")
+    orig_glMultiDrawElements(mode, count, type, indices, drawcount);
+}
+
+static void hook_glDrawArraysIndirect(GLenum mode, const void* indirect) {
+    DIAG_LOG("glDrawArraysIndirect")
+    orig_glDrawArraysIndirect(mode, indirect);
+}
+
+static void hook_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+    DIAG_LOG("glDrawElementsIndirect")
+    orig_glDrawElementsIndirect(mode, type, indirect);
+}
+
+static void hook_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
+                                           const void* indices, GLint basevertex) {
+    DIAG_LOG("glDrawElementsBaseVertex")
+    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0 && g_depth_bypass) {
+        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+        orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
+        set_uniform_color(g_color_behind);
+        orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+        if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
+        orig_glDepthFunc(GL_ALWAYS); orig_glDepthMask(GL_TRUE);
+        set_uniform_color(g_color);
+        orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+        orig_glDepthFunc(g_game_depth_func); orig_glDepthMask(g_game_depth_mask);
+        return;
+    }
+    orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+}
+
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
 static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* value) {
     if (g_hook_call_count < 10) {
@@ -631,13 +717,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|2.7|Two-pass wallhack: + instanced draw hook untuk ped LOD|brruham";
+        "solidskin|2.8diag|Two-pass wallhack diagnostik: cari draw call ped tidak terdeteksi|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v2.7 (+ hook DrawArraysInstanced & DrawElementsInstanced)");
+    logf_("[SOLIDSKIN] OnModPreLoad v2.8diag (hook semua kandidat draw + DIAG log)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -648,6 +734,7 @@ EXPORT void OnModPreLoad() {
     g_blend_currently_on        = 0;
     g_we_overrode_color         = 0;
     g_log_draw_count            = 0;
+    g_diag_count                = 0;
     g_log_bind_count            = 0;
     g_block_blend               = 1;
     g_force_blendfunc           = 1;
@@ -671,7 +758,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v2.7 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v2.8diag mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -733,6 +820,12 @@ EXPORT void OnModLoad() {
     HOOK_WARN(glDepthRangef)
     HOOK_WARN(glDrawArraysInstanced)
     HOOK_WARN(glDrawElementsInstanced)
+    HOOK_WARN(glDrawRangeElements)
+    HOOK_WARN(glMultiDrawArrays)
+    HOOK_WARN(glMultiDrawElements)
+    HOOK_WARN(glDrawArraysIndirect)
+    HOOK_WARN(glDrawElementsIndirect)
+    HOOK_WARN(glDrawElementsBaseVertex)
 
     #undef HOOK_WARN
 
@@ -741,8 +834,8 @@ EXPORT void OnModLoad() {
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.7 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (fix v2.7: + hook instanced draw)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v2.8diag - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v2.8diag: cari draw call ped)");
 }
 
 } // extern "C"
