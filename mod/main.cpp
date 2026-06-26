@@ -457,7 +457,7 @@ static void two_pass_draw_arrays(GLenum mode, GLint first, GLsizei count) {
 static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     // Cukup is_ped=1 untuk two-pass, tidak perlu tunggu g_we_overrode_color
     // karena game kadang cache uniform dan tidak panggil glUniform4fv lagi
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
             logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d", g_current_program, count);
             g_log_draw_count++;
@@ -475,7 +475,7 @@ static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
 }
 
 static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
             logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d", g_current_program, count);
             g_log_draw_count++;
@@ -497,7 +497,7 @@ static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 // Sama persis logikanya dengan non-instanced, hanya forward ke instanced orig.
 
 static void hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
             logff_("[SOLIDSKIN] DrawArraysInstanced two-pass prog=%u count=%d inst=%d",
                    g_current_program, count, instancecount);
@@ -532,7 +532,7 @@ static void hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, 
 
 static void hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
                                           const void* indices, GLsizei instancecount) {
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0) {
+    if (g_enabled && g_is_ped_program) {
         if (g_log_draw_count < 20) {
             logff_("[SOLIDSKIN] DrawElementsInstanced two-pass prog=%u count=%d inst=%d",
                    g_current_program, count, instancecount);
@@ -590,7 +590,7 @@ static int g_diag_count = 0;
 static void hook_glDrawRangeElements(GLenum mode, GLuint start, GLuint end,
                                       GLsizei count, GLenum type, const void* indices) {
     DIAG_LOG("glDrawRangeElements")
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0 && g_depth_bypass) {
+    if (g_enabled && g_is_ped_program && g_depth_bypass) {
         if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
         orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
         set_uniform_color(g_color_behind);
@@ -631,7 +631,7 @@ static void hook_glDrawElementsIndirect(GLenum mode, GLenum type, const void* in
 static void hook_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
                                            const void* indices, GLint basevertex) {
     DIAG_LOG("glDrawElementsBaseVertex")
-    if (g_enabled && g_is_ped_program && g_materialDiffuse_loc >= 0 && g_depth_bypass) {
+    if (g_enabled && g_is_ped_program && g_depth_bypass) {
         if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
         orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
         set_uniform_color(g_color_behind);
@@ -790,13 +790,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.1|Two-pass wallhack: hook GLES2+GLES3+EGL draw pointers|brruham";
+        "solidskin|3.2|Two-pass wallhack: is_ped cukup untuk two-pass|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.1 (+ hook EGL draw pointers langsung)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.2 (fix: two-pass tanpa syarat diffuse_loc>=0)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -834,7 +834,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.1 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.2 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -969,8 +969,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.1 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.1: GLES2+GLES3+EGL draw hook aktif)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.2 - auto enabled");
+    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.2: two-pass tanpa syarat diffuse_loc)");
 }
 
 } // extern "C"
