@@ -455,13 +455,13 @@ static void two_pass_draw_arrays(GLenum mode, GLint first, GLsizei count) {
 
 // ─── Hook: glDrawElements / glDrawArrays ─────────────────────────────────────
 static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    // Cukup is_ped=1 untuk two-pass, tidak perlu tunggu g_we_overrode_color
-    // karena game kadang cache uniform dan tidak panggil glUniform4fv lagi
+    // v3.3: log SEMUA draw call
+    if (g_log_draw_count < 100) {
+        logff_("[SOLIDSKIN] DrawElements prog=%u is_ped=%d count=%d",
+               g_current_program, g_is_ped_program, count);
+        g_log_draw_count++;
+    }
     if (g_enabled && g_is_ped_program) {
-        if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawElements two-pass prog=%u count=%d", g_current_program, count);
-            g_log_draw_count++;
-        }
         if (g_depth_bypass) {
             two_pass_draw_elements(mode, count, type, indices);
         } else {
@@ -475,11 +475,13 @@ static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
 }
 
 static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    // v3.3: log SEMUA draw call (bukan hanya ped) untuk cari prog 149
+    if (g_log_draw_count < 100) {
+        logff_("[SOLIDSKIN] DrawArrays prog=%u is_ped=%d count=%d",
+               g_current_program, g_is_ped_program, count);
+        g_log_draw_count++;
+    }
     if (g_enabled && g_is_ped_program) {
-        if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawArrays two-pass prog=%u count=%d", g_current_program, count);
-            g_log_draw_count++;
-        }
         if (g_depth_bypass) {
             two_pass_draw_arrays(mode, first, count);
         } else {
@@ -790,13 +792,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.2|Two-pass wallhack: is_ped cukup untuk two-pass|brruham";
+        "solidskin|3.3|log semua draw call untuk trace prog 149|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.2 (fix: two-pass tanpa syarat diffuse_loc>=0)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.3 (log semua draw call)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -834,7 +836,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.2 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.3 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -969,8 +971,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.2 - auto enabled");
-    logf_("[SOLIDSKIN] KUNING = di balik tembok, HIJAU = kelihatan (v3.2: two-pass tanpa syarat diffuse_loc)");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.3 - auto enabled");
+    logf_("[SOLIDSKIN] v3.3: log semua DrawArrays/Elements tanpa syarat");
 }
 
 } // extern "C"
