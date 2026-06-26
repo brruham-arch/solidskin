@@ -573,60 +573,6 @@ static const char* g_draw_keywords[] = {
     "Draw", "draw", nullptr
 };
 
-// Hook draw func via pointer yg dikembalikan eglGetProcAddress.
-// Game bisa saja pakai pointer ini secara langsung (disimpan di vtable/global),
-// sehingga hook kita di libGLESv2/v3 tidak kena. Kita hook pointer EGL-nya.
-static bool g_egl_hooks_applied = false;
-
-static void apply_egl_draw_hooks(void* dobbyHook_fn) {
-    if (g_egl_hooks_applied || !orig_eglGetProcAddress) return;
-    g_egl_hooks_applied = true;
-
-    auto dobbyHook = (int(*)(void*, void*, void**))dobbyHook_fn;
-
-    // Helper: hook pointer yg didapat dari eglGetProcAddress jika berbeda dari yg sudah di-hook
-    auto try_hook_egl_ptr = [&](const char* name, void* hook_fn, void** orig_ptr_slot) {
-        auto p = (void*)orig_eglGetProcAddress(name);
-        if (!p) { logff_("[SOLIDSKIN] EGL ptr %s: null", name); return; }
-        if (p == *orig_ptr_slot) { logff_("[SOLIDSKIN] EGL ptr %s: sama dg yg sudah di-hook, skip", name); return; }
-        void* saved = p;
-        if (dobbyHook(p, hook_fn, &saved) == 0) {
-            logff_("[SOLIDSKIN] hook EGL-ptr %s OK (%p)", name, p);
-        } else {
-            logff_("[SOLIDSKIN] WARNING: hook EGL-ptr %s GAGAL (%p)", name, p);
-        }
-    };
-
-    try_hook_egl_ptr("glDrawArrays",            (void*)hook_glDrawArrays,            (void**)&orig_glDrawArrays);
-    try_hook_egl_ptr("glDrawElements",           (void*)hook_glDrawElements,           (void**)&orig_glDrawElements);
-    try_hook_egl_ptr("glDrawArraysInstanced",    (void*)hook_glDrawArraysInstanced,    (void**)&orig_glDrawArraysInstanced);
-    try_hook_egl_ptr("glDrawElementsInstanced",  (void*)hook_glDrawElementsInstanced,  (void**)&orig_glDrawElementsInstanced);
-    try_hook_egl_ptr("glDrawRangeElements",      (void*)hook_glDrawRangeElements,      (void**)&orig_glDrawRangeElements);
-    try_hook_egl_ptr("glDrawArraysIndirect",     (void*)hook_glDrawArraysIndirect,     (void**)&orig_glDrawArraysIndirect);
-    try_hook_egl_ptr("glDrawElementsIndirect",   (void*)hook_glDrawElementsIndirect,   (void**)&orig_glDrawElementsIndirect);
-    try_hook_egl_ptr("glDrawElementsBaseVertex", (void*)hook_glDrawElementsBaseVertex, (void**)&orig_glDrawElementsBaseVertex);
-}
-
-// Simpan dobbyHook ptr untuk dipakai di apply_egl_draw_hooks
-static void* g_dobbyHook_fn = nullptr;
-
-static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
-    auto result = orig_eglGetProcAddress(procname);
-    if (procname) {
-        for (int i = 0; g_draw_keywords[i]; i++) {
-            if (strstr(procname, g_draw_keywords[i])) {
-                logff_("[SOLIDSKIN] eglGetProcAddress: %s -> %p", procname, (void*)result);
-                // Hook EGL draw pointers saat pertama kali game minta salah satunya
-                if (!g_egl_hooks_applied && g_dobbyHook_fn) {
-                    apply_egl_draw_hooks(g_dobbyHook_fn);
-                }
-                break;
-            }
-        }
-    }
-    return result;
-}
-
 // ─── Hook: kandidat draw tambahan (DIAGNOSTIK v2.8) ─────────────────────────
 // Tujuan: cari tahu fungsi draw MANA yang dipakai prog ped yang tidak
 // terdeksi oleh glDrawArrays/Elements/Instanced. Setiap fungsi log
@@ -699,6 +645,60 @@ static void hook_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum typ
         return;
     }
     orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+}
+
+// Hook draw func via pointer yg dikembalikan eglGetProcAddress.
+// Game bisa saja pakai pointer ini secara langsung (disimpan di vtable/global),
+// sehingga hook kita di libGLESv2/v3 tidak kena. Kita hook pointer EGL-nya.
+static bool g_egl_hooks_applied = false;
+
+static void apply_egl_draw_hooks(void* dobbyHook_fn) {
+    if (g_egl_hooks_applied || !orig_eglGetProcAddress) return;
+    g_egl_hooks_applied = true;
+
+    auto dobbyHook = (int(*)(void*, void*, void**))dobbyHook_fn;
+
+    // Helper: hook pointer yg didapat dari eglGetProcAddress jika berbeda dari yg sudah di-hook
+    auto try_hook_egl_ptr = [&](const char* name, void* hook_fn, void** orig_ptr_slot) {
+        auto p = (void*)orig_eglGetProcAddress(name);
+        if (!p) { logff_("[SOLIDSKIN] EGL ptr %s: null", name); return; }
+        if (p == *orig_ptr_slot) { logff_("[SOLIDSKIN] EGL ptr %s: sama dg yg sudah di-hook, skip", name); return; }
+        void* saved = p;
+        if (dobbyHook(p, hook_fn, &saved) == 0) {
+            logff_("[SOLIDSKIN] hook EGL-ptr %s OK (%p)", name, p);
+        } else {
+            logff_("[SOLIDSKIN] WARNING: hook EGL-ptr %s GAGAL (%p)", name, p);
+        }
+    };
+
+    try_hook_egl_ptr("glDrawArrays",            (void*)hook_glDrawArrays,            (void**)&orig_glDrawArrays);
+    try_hook_egl_ptr("glDrawElements",           (void*)hook_glDrawElements,           (void**)&orig_glDrawElements);
+    try_hook_egl_ptr("glDrawArraysInstanced",    (void*)hook_glDrawArraysInstanced,    (void**)&orig_glDrawArraysInstanced);
+    try_hook_egl_ptr("glDrawElementsInstanced",  (void*)hook_glDrawElementsInstanced,  (void**)&orig_glDrawElementsInstanced);
+    try_hook_egl_ptr("glDrawRangeElements",      (void*)hook_glDrawRangeElements,      (void**)&orig_glDrawRangeElements);
+    try_hook_egl_ptr("glDrawArraysIndirect",     (void*)hook_glDrawArraysIndirect,     (void**)&orig_glDrawArraysIndirect);
+    try_hook_egl_ptr("glDrawElementsIndirect",   (void*)hook_glDrawElementsIndirect,   (void**)&orig_glDrawElementsIndirect);
+    try_hook_egl_ptr("glDrawElementsBaseVertex", (void*)hook_glDrawElementsBaseVertex, (void**)&orig_glDrawElementsBaseVertex);
+}
+
+// Simpan dobbyHook ptr untuk dipakai di apply_egl_draw_hooks
+static void* g_dobbyHook_fn = nullptr;
+
+static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
+    auto result = orig_eglGetProcAddress(procname);
+    if (procname) {
+        for (int i = 0; g_draw_keywords[i]; i++) {
+            if (strstr(procname, g_draw_keywords[i])) {
+                logff_("[SOLIDSKIN] eglGetProcAddress: %s -> %p", procname, (void*)result);
+                // Hook EGL draw pointers saat pertama kali game minta salah satunya
+                if (!g_egl_hooks_applied && g_dobbyHook_fn) {
+                    apply_egl_draw_hooks(g_dobbyHook_fn);
+                }
+                break;
+            }
+        }
+    }
+    return result;
 }
 
 // ─── Hook: glUniform4fv ───────────────────────────────────────────────────────
