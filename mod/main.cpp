@@ -84,6 +84,19 @@ typedef void  (*glDrawElementsIndirect_t)(GLenum, GLenum, const void*);
 typedef void  (*glDrawElementsBaseVertex_t)(GLenum, GLsizei, GLenum, const void*, GLint);
 typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_t)(const char*);
 
+// ─── RenderWare pipeline types ────────────────────────────────────────────────
+typedef void (*RwRenderCB_t)(void*, void*, uint8_t, uint32_t);
+typedef void* (*RpSkinGetOpenGLPipeline_t)(int skinType);
+typedef void  (*RxOpenGLAllInOneSetRenderCallBack_t)(void* node, RwRenderCB_t cb);
+typedef RwRenderCB_t (*RxOpenGLAllInOneGetRenderCallBack_t)(void* node);
+
+static RpSkinGetOpenGLPipeline_t           fn_RpSkinGetOpenGLPipeline           = nullptr;
+static RxOpenGLAllInOneSetRenderCallBack_t  fn_RxOpenGLAllInOneSetRenderCallBack  = nullptr;
+static RxOpenGLAllInOneGetRenderCallBack_t  fn_RxOpenGLAllInOneGetRenderCallBack  = nullptr;
+
+static RwRenderCB_t g_orig_skin_render_cb[4] = {nullptr};
+static int          g_rw_hook_installed       = 0;
+
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
 static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
@@ -686,6 +699,113 @@ static void apply_egl_draw_hooks(void* dobbyHook_fn) {
 // Simpan dobbyHook ptr untuk dipakai di apply_egl_draw_hooks
 static void* g_dobbyHook_fn = nullptr;
 
+// ─── RenderWare skin render callback hook ────────────────────────────────────
+// Dipanggil oleh RenderWare untuk setiap draw ped via internal pipeline.
+// Kita intercept di sini untuk two-pass tanpa perlu hook glDrawArrays.
+
+static void rw_skin_render_cb(void* resEntry, void* object,
+                               uint8_t type, uint32_t flags) {
+    // Cari orig CB yang sesuai (pakai index 0 sebagai representasi semua)
+    RwRenderCB_t orig = g_orig_skin_render_cb[0];
+    if (!orig || !g_enabled || !g_depth_bypass) {
+        if (orig) orig(resEntry, object, type, flags);
+        return;
+    }
+
+    force_opaque_state();
+
+    // ── Pass 1: KUNING – di balik tembok ─────────────────────────────────
+    if (orig_glDepthRangef)
+        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+    orig_glDepthFunc(GL_GREATER);
+    orig_glDepthMask(GL_FALSE);
+    set_uniform_color(g_color_behind);
+    orig(resEntry, object, type, flags);
+
+    // ── Pass 2: HIJAU – terlihat normal ──────────────────────────────────
+    if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
+    orig_glDepthFunc(GL_ALWAYS);
+    orig_glDepthMask(GL_TRUE);
+    set_uniform_color(g_color);
+    orig(resEntry, object, type, flags);
+
+    // ── Restore ───────────────────────────────────────────────────────────
+    if (orig_glDepthRangef)
+        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+    orig_glDepthFunc(g_game_depth_func);
+    orig_glDepthMask(g_game_depth_mask);
+}
+
+// Akses RxPipelineNode dari RxPipeline* dan install render CB kita.
+// Dari analisa disassembly:
+//   pipeline + 0x18 → nodes_container*
+//   nodes_container + 0x58 → RxPipelineNode*
+//   RxOpenGLAllInOneSetRenderCallBack(node, cb) → node+0x10 = cb
+static void install_rw_render_cb_for_skin(int skinType) {
+    if (!fn_RpSkinGetOpenGLPipeline || !fn_RxOpenGLAllInOneSetRenderCallBack ||
+        !fn_RxOpenGLAllInOneGetRenderCallBack) return;
+
+    void* pipeline = fn_RpSkinGetOpenGLPipeline(skinType);
+    if (!pipeline) {
+        logff_("[SOLIDSKIN] RW: pipeline skinType=%d = NULL", skinType);
+        return;
+    }
+
+    // nodes_container = pipeline + 0x18
+    void* nodes_container = *(void**)((uint8_t*)pipeline + 0x18);
+    if (!nodes_container) {
+        logff_("[SOLIDSKIN] RW: nodes_container NULL skinType=%d", skinType);
+        return;
+    }
+
+    // node = nodes_container + 0x58
+    void* node = *(void**)((uint8_t*)nodes_container + 0x58);
+    if (!node) {
+        logff_("[SOLIDSKIN] RW: node NULL skinType=%d", skinType);
+        return;
+    }
+
+    // Simpan orig CB
+    RwRenderCB_t orig = fn_RxOpenGLAllInOneGetRenderCallBack(node);
+    if (orig == rw_skin_render_cb) {
+        logff_("[SOLIDSKIN] RW: skinType=%d sudah ter-hook, skip", skinType);
+        return;
+    }
+
+    if (skinType < 4) g_orig_skin_render_cb[skinType] = orig;
+    // Pakai index 0 sebagai shared orig (semua skin type pakai CB yang sama)
+    if (!g_orig_skin_render_cb[0] && orig) g_orig_skin_render_cb[0] = orig;
+
+    fn_RxOpenGLAllInOneSetRenderCallBack(node, rw_skin_render_cb);
+    logff_("[SOLIDSKIN] RW: hook skinType=%d node=%p orig=%p OK",
+           skinType, node, (void*)orig);
+}
+
+static void install_rw_hooks(void) {
+    if (g_rw_hook_installed) return;
+    if (!fn_RpSkinGetOpenGLPipeline) return;
+
+    logf_("[SOLIDSKIN] RW: install render CB hooks...");
+    // Skin type 0..3 (standard, matfx, env, combinedmatfx)
+    for (int i = 0; i < 4; i++) {
+        install_rw_render_cb_for_skin(i);
+    }
+    g_rw_hook_installed = 1;
+    logf_("[SOLIDSKIN] RW: hooks installed");
+}
+
+// Hook _rpCreatePlatformAtomicPipelines — dipanggil saat pipeline ped dibuat.
+// Setelah fungsi ini selesai, kita install render CB kita.
+typedef int (*rpCreatePlatformAtomicPipelines_t)(void);
+static rpCreatePlatformAtomicPipelines_t orig_rpCreatePlatformAtomicPipelines = nullptr;
+
+static int hook_rpCreatePlatformAtomicPipelines(void) {
+    int result = orig_rpCreatePlatformAtomicPipelines();
+    logff_("[SOLIDSKIN] _rpCreatePlatformAtomicPipelines ret=%d, install RW hooks", result);
+    install_rw_hooks();
+    return result;
+}
+
 static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
     auto result = orig_eglGetProcAddress(procname);
     if (procname) {
@@ -792,13 +912,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.3|log semua draw call untuk trace prog 149|brruham";
+        "solidskin|3.4|RenderWare pipeline hook untuk ped behind-wall|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.3 (log semua draw call)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.4 (RenderWare pipeline hook)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -836,7 +956,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.3 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.4 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -967,12 +1087,48 @@ EXPORT void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
+    // ── Hook RenderWare pipeline (untuk ped yang tidak lewat glDrawArrays) ─
+    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!hGTASA) hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_GLOBAL);
+    if (hGTASA) {
+        fn_RpSkinGetOpenGLPipeline = (RpSkinGetOpenGLPipeline_t)
+            dlsym(hGTASA, "RpSkinGetOpenGLPipeline");
+        fn_RxOpenGLAllInOneSetRenderCallBack = (RxOpenGLAllInOneSetRenderCallBack_t)
+            dlsym(hGTASA, "_Z33RxOpenGLAllInOneSetRenderCallBackP14RxPipelineNodePFvP10RwResEntryPvhjE");
+        fn_RxOpenGLAllInOneGetRenderCallBack = (RxOpenGLAllInOneGetRenderCallBack_t)
+            dlsym(hGTASA, "_Z33RxOpenGLAllInOneGetRenderCallBackP14RxPipelineNode");
+
+        logff_("[SOLIDSKIN] RpSkinGetOpenGLPipeline = %p", (void*)fn_RpSkinGetOpenGLPipeline);
+        logff_("[SOLIDSKIN] SetRenderCallBack = %p", (void*)fn_RxOpenGLAllInOneSetRenderCallBack);
+        logff_("[SOLIDSKIN] GetRenderCallBack = %p", (void*)fn_RxOpenGLAllInOneGetRenderCallBack);
+
+        // Hook _rpCreatePlatformAtomicPipelines agar kita tahu kapan pipeline siap
+        auto rpCreate = (rpCreatePlatformAtomicPipelines_t)
+            dlsym(hGTASA, "_Z32_rpCreatePlatformAtomicPipelinesv");
+        if (rpCreate) {
+            if (dobbyHook((void*)rpCreate,
+                          (void*)hook_rpCreatePlatformAtomicPipelines,
+                          (void**)&orig_rpCreatePlatformAtomicPipelines) == 0) {
+                logf_("[SOLIDSKIN] hook _rpCreatePlatformAtomicPipelines OK");
+            } else {
+                logf_("[SOLIDSKIN] WARNING: hook _rpCreatePlatformAtomicPipelines gagal");
+            }
+        } else {
+            logf_("[SOLIDSKIN] WARNING: _rpCreatePlatformAtomicPipelines tidak ditemukan");
+        }
+
+        // Coba install sekarang juga kalau pipeline sudah ada
+        install_rw_hooks();
+    } else {
+        logf_("[SOLIDSKIN] WARNING: libGTASA.so tidak bisa di-dlopen");
+    }
+
     // Coba apply EGL draw hooks sekarang juga (bukan nunggu game panggil eglGetProcAddress)
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.3 - auto enabled");
-    logf_("[SOLIDSKIN] v3.3: log semua DrawArrays/Elements tanpa syarat");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.4 - auto enabled");
+    logf_("[SOLIDSKIN] v3.4: RenderWare pipeline hook + glDrawArrays hook");
 }
 
 } // extern "C"
