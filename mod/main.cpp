@@ -787,41 +787,60 @@ static void install_rw_hooks(void) {
 
     logf_("[SOLIDSKIN] RW: install render CB hooks...");
     int installed = 0;
+
+    // Dari analisa runtime:
+    //   pipeline+0x14 → nodedata ptr  (bukan +0x18 seperti asumsi awal)
+    //   nodedata+0x38 → renderCB      (bukan +0x10)
+    // skinType 0=standard, 1=matfx, 2=env, 3=combinedmatfx
+    // skinType 0 mengembalikan 0x1 (invalid), skip
+    // skinType 1 & 2 valid, skinType 3 = NULL
+
     for (int i = 0; i < 4; i++) {
         void* pipeline = fn_RpSkinGetOpenGLPipeline(i);
-        if (!pipeline) {
-            logff_("[SOLIDSKIN] RW: pipeline skinType=%d = NULL", i);
+        uintptr_t pip_addr = (uintptr_t)pipeline;
+
+        // Skip invalid: NULL, 0x1 (Thumb bit artifact), atau sangat kecil
+        if (pip_addr <= 0x10) {
+            logff_("[SOLIDSKIN] RW: skinType=%d pipeline=0x%X skip", i, (unsigned)pip_addr);
             continue;
         }
-        void* nodes_container = *(void**)((uint8_t*)pipeline + 0x18);
-        if (!nodes_container) {
-            logff_("[SOLIDSKIN] RW: nodes_container NULL skinType=%d", i);
+
+        // nodedata = *(pipeline + 0x14)
+        void* nodedata = *(void**)((uint8_t*)pipeline + 0x14);
+        if (!nodedata) {
+            logff_("[SOLIDSKIN] RW: skinType=%d nodedata NULL", i);
             continue;
         }
-        void* node = *(void**)((uint8_t*)nodes_container + 0x58);
-        if (!node) {
-            logff_("[SOLIDSKIN] RW: node NULL skinType=%d", i);
-            continue;
-        }
-        RwRenderCB_t orig = fn_RxOpenGLAllInOneGetRenderCallBack(node);
+
+        // renderCB = *(nodedata + 0x38)
+        RwRenderCB_t* cb_slot = (RwRenderCB_t*)((uint8_t*)nodedata + 0x38);
+        RwRenderCB_t orig = *cb_slot;
+
+        logff_("[SOLIDSKIN] RW: skinType=%d pipeline=0x%X nodedata=0x%X renderCB=0x%X",
+               i, (unsigned)pip_addr, (unsigned)(uintptr_t)nodedata, (unsigned)(uintptr_t)orig);
+
         if (orig == rw_skin_render_cb) {
-            logff_("[SOLIDSKIN] RW: skinType=%d sudah ter-hook, skip", i);
+            logff_("[SOLIDSKIN] RW: skinType=%d sudah ter-hook", i);
             installed++;
             continue;
         }
+
+        // Simpan orig (pakai index 0 sebagai shared)
         if (i < 4) g_orig_skin_render_cb[i] = orig;
         if (!g_orig_skin_render_cb[0] && orig) g_orig_skin_render_cb[0] = orig;
-        fn_RxOpenGLAllInOneSetRenderCallBack(node, rw_skin_render_cb);
-        logff_("[SOLIDSKIN] RW: hook skinType=%d node=%p orig=%p OK",
-               i, node, (void*)orig);
+
+        // Patch langsung ke slot (tidak perlu RxOpenGLAllInOneSetRenderCallBack)
+        *cb_slot = rw_skin_render_cb;
+        logff_("[SOLIDSKIN] RW: skinType=%d hook OK orig=0x%X",
+               i, (unsigned)(uintptr_t)orig);
         installed++;
     }
-    // Hanya set flag kalau minimal 1 berhasil
+
     if (installed > 0) {
         g_rw_hook_installed = 1;
         logff_("[SOLIDSKIN] RW: %d hooks installed", installed);
     } else {
-        logf_("[SOLIDSKIN] RW: semua pipeline NULL, akan retry nanti");
+        logf_("[SOLIDSKIN] RW: semua pipeline invalid, akan retry nanti");
     }
 }
 
@@ -943,13 +962,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.5|fix RW hook retry setelah pipeline init|brruham";
+        "solidskin|3.6|fix offset renderCB nodedata+0x38|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.5 (fix RW hook retry after pipeline init)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.6 (fix offset nodedata+0x38 untuk renderCB)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -987,7 +1006,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.5 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.6 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1158,8 +1177,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.5 - auto enabled");
-    logf_("[SOLIDSKIN] v3.5: RW hook retry setelah _rpCreatePlatformAtomicPipelines");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.6 - auto enabled");
+    logf_("[SOLIDSKIN] v3.6: patch renderCB di nodedata+0x38 langsung");
 }
 
 } // extern "C"
