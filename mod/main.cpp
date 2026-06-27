@@ -720,6 +720,20 @@ static void rw_skin_render_cb(void* resEntry, void* object,
         return;
     }
 
+    // Resolve MaterialDiffuse/Ambient loc kalau belum (atau untuk prog saat ini)
+    // g_materialDiffuse_loc mungkin -1 atau milik program lain
+    GLint d_loc = -1, a_loc = -1;
+    if (g_current_program > 0) {
+        d_loc = orig_glGetUniformLocation(g_current_program, "MaterialDiffuse");
+        a_loc = orig_glGetUniformLocation(g_current_program, "MaterialAmbient");
+    }
+
+    // Helper: set warna langsung dengan loc yang baru di-resolve
+    auto set_color_rw = [&](const float col[4]) {
+        if (d_loc >= 0) orig_glUniform4fv(d_loc, 1, col);
+        if (a_loc >= 0) orig_glUniform4fv(a_loc, 1, col);
+    };
+
     force_opaque_state();
 
     // ── Pass 1: KUNING – di balik tembok ─────────────────────────────────
@@ -727,16 +741,18 @@ static void rw_skin_render_cb(void* resEntry, void* object,
         orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
     orig_glDepthFunc(GL_GREATER);
     orig_glDepthMask(GL_FALSE);
-    // Set flag agar hook_glUniform4fv tahu pass mana yang sedang jalan
     g_in_rw_render = 1;
-    g_rw_pass      = 1;  // kuning
+    g_rw_pass      = 1;
+    set_color_rw(g_color_behind);
     orig(resEntry, object, type, flags);
+    set_color_rw(g_color_behind);  // timpa kembali kalau orig reset warna
 
     // ── Pass 2: HIJAU – terlihat normal ──────────────────────────────────
     if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
     orig_glDepthFunc(GL_ALWAYS);
     orig_glDepthMask(GL_TRUE);
-    g_rw_pass = 2;  // hijau
+    g_rw_pass = 2;
+    set_color_rw(g_color);
     orig(resEntry, object, type, flags);
 
     g_in_rw_render = 0;
@@ -747,6 +763,7 @@ static void rw_skin_render_cb(void* resEntry, void* object,
         orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
     orig_glDepthFunc(g_game_depth_func);
     orig_glDepthMask(g_game_depth_mask);
+    set_color_rw(g_color);
 }
 
 // Akses RxPipelineNode dari RxPipeline* dan install render CB kita.
@@ -985,13 +1002,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.8|RW CB intercept warna via glUniform4fv flag|brruham";
+        "solidskin|3.9|RW CB resolve loc dan set warna langsung|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.8 (RW CB intercept via glUniform4fv flag)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.9 (RW CB resolve loc + set warna langsung)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -1029,7 +1046,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.8 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.9 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1200,8 +1217,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.8 - auto enabled");
-    logf_("[SOLIDSKIN] v3.8: intercept warna RW via g_in_rw_render flag");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.9 - auto enabled");
+    logf_("[SOLIDSKIN] v3.9: RW CB resolve MaterialDiffuse loc + set warna langsung");
 }
 
 } // extern "C"
