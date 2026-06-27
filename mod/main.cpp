@@ -96,6 +96,8 @@ static RxOpenGLAllInOneGetRenderCallBack_t  fn_RxOpenGLAllInOneGetRenderCallBack
 
 static RwRenderCB_t g_orig_skin_render_cb[4] = {nullptr};
 static int          g_rw_hook_installed       = 0;
+static int          g_in_rw_render            = 0;  // 1 saat rw_skin_render_cb aktif
+static int          g_rw_pass                 = 0;  // 1=kuning(behind), 2=hijau(visible)
 
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
@@ -712,7 +714,6 @@ static void* g_dobbyHook_fn = nullptr;
 
 static void rw_skin_render_cb(void* resEntry, void* object,
                                uint8_t type, uint32_t flags) {
-    // Cari orig CB yang sesuai (pakai index 0 sebagai representasi semua)
     RwRenderCB_t orig = g_orig_skin_render_cb[0];
     if (!orig || !g_enabled || !g_depth_bypass) {
         if (orig) orig(resEntry, object, type, flags);
@@ -726,15 +727,20 @@ static void rw_skin_render_cb(void* resEntry, void* object,
         orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
     orig_glDepthFunc(GL_GREATER);
     orig_glDepthMask(GL_FALSE);
-    set_uniform_color(g_color_behind);
+    // Set flag agar hook_glUniform4fv tahu pass mana yang sedang jalan
+    g_in_rw_render = 1;
+    g_rw_pass      = 1;  // kuning
     orig(resEntry, object, type, flags);
 
     // ── Pass 2: HIJAU – terlihat normal ──────────────────────────────────
     if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
     orig_glDepthFunc(GL_ALWAYS);
     orig_glDepthMask(GL_TRUE);
-    set_uniform_color(g_color);
+    g_rw_pass = 2;  // hijau
     orig(resEntry, object, type, flags);
+
+    g_in_rw_render = 0;
+    g_rw_pass      = 0;
 
     // ── Restore ───────────────────────────────────────────────────────────
     if (orig_glDepthRangef)
@@ -921,12 +927,21 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
     // Intercept warna diffuse/ambient -> set ke warna HIJAU (g_color)
     // Warna KUNING untuk behind-wall diterapkan langsung di draw call pass 1.
     if (location != -1 && location == g_materialDiffuse_loc) {
-        orig_glUniform4fv(location, count, g_color);
+        // Saat RW render CB aktif, pilih warna sesuai pass
+        const float* col = g_color;
+        if (g_in_rw_render) {
+            col = (g_rw_pass == 1) ? g_color_behind : g_color;
+        }
+        orig_glUniform4fv(location, count, col);
         g_we_overrode_color = 1;
         return;
     }
     if (location != -1 && location == g_materialAmbient_loc) {
-        orig_glUniform4fv(location, count, g_color);
+        const float* col = g_color;
+        if (g_in_rw_render) {
+            col = (g_rw_pass == 1) ? g_color_behind : g_color;
+        }
+        orig_glUniform4fv(location, count, col);
         g_we_overrode_color = 1;
         return;
     }
@@ -970,13 +985,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.7|lazy RW hook di glUseProgram|brruham";
+        "solidskin|3.8|RW CB intercept warna via glUniform4fv flag|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.7 (lazy RW hook di glUseProgram)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.8 (RW CB intercept via glUniform4fv flag)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -1014,7 +1029,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.7 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.8 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1185,8 +1200,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.7 - auto enabled");
-    logf_("[SOLIDSKIN] v3.7: lazy RW hook polling di hook_glUseProgram");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.8 - auto enabled");
+    logf_("[SOLIDSKIN] v3.8: intercept warna RW via g_in_rw_render flag");
 }
 
 } // extern "C"
