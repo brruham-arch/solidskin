@@ -315,6 +315,9 @@ static void hook_glDepthMask(GLboolean flag) {
     orig_glDepthMask(flag);
 }
 
+// Forward declaration
+static void install_rw_hooks(void);
+
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
     // Lazy install RW hooks — poll sampai pipeline valid
