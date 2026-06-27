@@ -317,6 +317,10 @@ static void hook_glDepthMask(GLboolean flag) {
 
 // ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
+    // Lazy install RW hooks — poll sampai pipeline valid
+    if (!g_rw_hook_installed && fn_RpSkinGetOpenGLPipeline) {
+        install_rw_hooks();
+    }
     if (g_enabled && g_texture_override && !g_solid_tex_ready)
         try_init_solid_texture();
 
@@ -851,8 +855,9 @@ static rpCreatePlatformAtomicPipelines_t orig_rpCreatePlatformAtomicPipelines = 
 
 static int hook_rpCreatePlatformAtomicPipelines(void) {
     int result = orig_rpCreatePlatformAtomicPipelines();
-    logff_("[SOLIDSKIN] _rpCreatePlatformAtomicPipelines ret=%d, install RW hooks", result);
-    install_rw_hooks();
+    logff_("[SOLIDSKIN] _rpCreatePlatformAtomicPipelines ret=%d", result);
+    // Tidak install di sini — pipeline belum ter-isi saat fungsi ini return.
+    // Install akan dilakukan dari hook_glUseProgram secara lazy.
     return result;
 }
 
@@ -962,13 +967,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.6|fix offset renderCB nodedata+0x38|brruham";
+        "solidskin|3.7|lazy RW hook di glUseProgram|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.6 (fix offset nodedata+0x38 untuk renderCB)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.7 (lazy RW hook di glUseProgram)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -1006,7 +1011,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.6 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.7 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1177,8 +1182,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.6 - auto enabled");
-    logf_("[SOLIDSKIN] v3.6: patch renderCB di nodedata+0x38 langsung");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.7 - auto enabled");
+    logf_("[SOLIDSKIN] v3.7: lazy RW hook polling di hook_glUseProgram");
 }
 
 } // extern "C"
