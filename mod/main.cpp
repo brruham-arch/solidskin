@@ -720,15 +720,12 @@ static void rw_skin_render_cb(void* resEntry, void* object,
         return;
     }
 
-    // Resolve MaterialDiffuse/Ambient loc kalau belum (atau untuk prog saat ini)
-    // g_materialDiffuse_loc mungkin -1 atau milik program lain
-    GLint d_loc = -1, a_loc = -1;
-    if (g_current_program > 0) {
-        d_loc = orig_glGetUniformLocation(g_current_program, "MaterialDiffuse");
-        a_loc = orig_glGetUniformLocation(g_current_program, "MaterialAmbient");
-    }
+    // Gunakan loc yang sudah di-cache dari hook_glUseProgram
+    // JANGAN panggil glGetUniformLocation di sini (crash RW resource)
+    // g_materialDiffuse_loc sudah valid karena glUseProgram dipanggil sebelum CB ini
+    GLint d_loc = g_materialDiffuse_loc;
+    GLint a_loc = g_materialAmbient_loc;
 
-    // Helper: set warna langsung dengan loc yang baru di-resolve
     auto set_color_rw = [&](const float col[4]) {
         if (d_loc >= 0) orig_glUniform4fv(d_loc, 1, col);
         if (a_loc >= 0) orig_glUniform4fv(a_loc, 1, col);
@@ -745,7 +742,7 @@ static void rw_skin_render_cb(void* resEntry, void* object,
     g_rw_pass      = 1;
     set_color_rw(g_color_behind);
     orig(resEntry, object, type, flags);
-    set_color_rw(g_color_behind);  // timpa kembali kalau orig reset warna
+    set_color_rw(g_color_behind);
 
     // ── Pass 2: HIJAU – terlihat normal ──────────────────────────────────
     if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
@@ -1002,13 +999,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.9|RW CB resolve loc dan set warna langsung|brruham";
+        "solidskin|3.10|fix crash RW CB pakai cached loc|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.9 (RW CB resolve loc + set warna langsung)");
+    logf_("[SOLIDSKIN] OnModPreLoad v3.10 (fix crash: no glGetUniformLocation in RW CB)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -1046,7 +1043,7 @@ EXPORT void OnModPreLoad() {
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.9 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v3.10 mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1217,8 +1214,8 @@ EXPORT void OnModLoad() {
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.9 - auto enabled");
-    logf_("[SOLIDSKIN] v3.9: RW CB resolve MaterialDiffuse loc + set warna langsung");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.10 - auto enabled");
+    logf_("[SOLIDSKIN] v3.10: RW CB pakai cached g_materialDiffuse_loc, no glGetUniformLocation");
 }
 
 } // extern "C"
