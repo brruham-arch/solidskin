@@ -378,9 +378,13 @@ static inline void set_uniform_color(const float col[4]) {
 
 static inline void apply_wallhack_state(void) {
     force_opaque_state();
-    // Render ped di atas semua geometry (wallhack)
+    // Render ped di atas semua geometry (wallhack).
+    // PENTING: depthMask harus TRUE supaya ped MENULIS depth 0.0 ke buffer.
+    // Kalau FALSE, ped lolos test (GL_ALWAYS) tapi depth buffer tetap berisi
+    // nilai lama -> geometry lain (tembok) yang digambar BELAKANGAN akan
+    // menang depth test normal dan menimpa pixel ped lagi (efek "terbalik").
     orig_glDepthFunc(GL_ALWAYS);
-    orig_glDepthMask(GL_FALSE);
+    orig_glDepthMask(GL_TRUE);
     if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
     set_uniform_color(g_color);
 }
