@@ -84,21 +84,6 @@ typedef void  (*glDrawElementsIndirect_t)(GLenum, GLenum, const void*);
 typedef void  (*glDrawElementsBaseVertex_t)(GLenum, GLsizei, GLenum, const void*, GLint);
 typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_t)(const char*);
 
-// ─── RenderWare pipeline types ────────────────────────────────────────────────
-typedef void (*RwRenderCB_t)(void*, void*, uint8_t, uint32_t);
-typedef void* (*RpSkinGetOpenGLPipeline_t)(int skinType);
-typedef void  (*RxOpenGLAllInOneSetRenderCallBack_t)(void* node, RwRenderCB_t cb);
-typedef RwRenderCB_t (*RxOpenGLAllInOneGetRenderCallBack_t)(void* node);
-
-static RpSkinGetOpenGLPipeline_t           fn_RpSkinGetOpenGLPipeline           = nullptr;
-static RxOpenGLAllInOneSetRenderCallBack_t  fn_RxOpenGLAllInOneSetRenderCallBack  = nullptr;
-static RxOpenGLAllInOneGetRenderCallBack_t  fn_RxOpenGLAllInOneGetRenderCallBack  = nullptr;
-
-static RwRenderCB_t g_orig_skin_render_cb[4] = {nullptr};
-static int          g_rw_hook_installed       = 0;
-static int          g_in_rw_render            = 0;  // 1 saat rw_skin_render_cb aktif
-static int          g_rw_pass                 = 0;  // 1=kuning(behind), 2=hijau(visible)
-
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
 static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
@@ -125,11 +110,6 @@ static glDrawArraysIndirect_t     orig_glDrawArraysIndirect     = nullptr;
 static glDrawElementsIndirect_t   orig_glDrawElementsIndirect   = nullptr;
 static glDrawElementsBaseVertex_t orig_glDrawElementsBaseVertex = nullptr;
 static eglGetProcAddress_t        orig_eglGetProcAddress        = nullptr;
-
-// Flag: prog yang sedang kita trace secara aktif
-static GLuint g_trace_prog = 149; // prog ped yang tidak punya draw call
-static int    g_trace_active = 0; // 1 kalau g_trace_prog sedang aktif
-static int    g_trace_log_count = 0;
 
 // ─── Runtime state ───────────────────────────────────────────────────────────
 static GLuint    g_current_program      = 0;
@@ -253,15 +233,10 @@ static void try_init_solid_texture(void) {
 }
 
 // ─── Hook: glDepthRangef ──────────────────────────────────────────────────────
-// Simpan state asli game; nilai aktual diset manual di draw call pass.
 static void hook_glDepthRangef(GLfloat n, GLfloat f) {
     g_game_depth_range_near = n;
     g_game_depth_range_far  = f;
-    // Jangan forward langsung -- draw call hook yg kendalikan depth range.
-    // Jika tidak sedang di ped, teruskan normal.
-    if (!(g_enabled && g_depth_bypass && g_is_ped_program)) {
-        orig_glDepthRangef(n, f);
-    }
+    orig_glDepthRangef(n, f);
 }
 
 // ─── Hook: glActiveTexture / glBindTexture ───────────────────────────────────
@@ -280,8 +255,8 @@ static void hook_glBindTexture(GLenum target, GLuint texture) {
     if (g_enabled && g_texture_override && g_solid_tex_ready &&
         target == GL_TEXTURE_2D && g_is_ped_program && texture != g_solid_tex) {
         if (g_log_bind_count < 30) {
-            logff_("[SOLIDSKIN] bindTex redirect %u->%u prog=%u trace=%d",
-                   texture, g_solid_tex, g_current_program, g_trace_active);
+            logff_("[SOLIDSKIN] bindTex redirect %u->%u prog=%u",
+                   texture, g_solid_tex, g_current_program);
             g_log_bind_count++;
         }
         in_self_bind = 1;
@@ -308,24 +283,15 @@ static void hook_glTexParameteri(GLenum target, GLenum pname, GLint param) {
 // ─── Hook: glDepthFunc / glDepthMask ─────────────────────────────────────────
 static void hook_glDepthFunc(GLenum func) {
     g_game_depth_func = func;
-    if (g_enabled && g_depth_bypass && g_is_ped_program) return; // dikendalikan draw call
     orig_glDepthFunc(func);
 }
 static void hook_glDepthMask(GLboolean flag) {
     g_game_depth_mask = flag;
-    if (g_enabled && g_depth_bypass && g_is_ped_program) return; // dikendalikan draw call
     orig_glDepthMask(flag);
 }
 
 // Forward declaration
-static void install_rw_hooks(void);
-
-// ─── Hook: glUseProgram ───────────────────────────────────────────────────────
 static void hook_glUseProgram(GLuint program) {
-    // Lazy install RW hooks — poll sampai pipeline valid
-    if (!g_rw_hook_installed && fn_RpSkinGetOpenGLPipeline) {
-        install_rw_hooks();
-    }
     if (g_enabled && g_texture_override && !g_solid_tex_ready)
         try_init_solid_texture();
 
@@ -366,18 +332,7 @@ static void hook_glUseProgram(GLuint program) {
 
         if (g_enabled && g_block_blend && g_is_ped_program)
             force_opaque_state();
-
-        // Restore depth state normal saat ganti ke non-ped program
-        if (!g_is_ped_program || !g_enabled || !g_depth_bypass) {
-            orig_glDepthFunc(g_game_depth_func);
-            orig_glDepthMask(g_game_depth_mask);
-            if (orig_glDepthRangef)
-                orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-        }
     }
-    // Trace: tandai kalau program yang dicurigai aktif
-    g_trace_active = (g_enabled && g_is_ped_program &&
-                      g_current_program == g_trace_prog) ? 1 : 0;
     orig_glUseProgram(program);
 }
 
@@ -415,140 +370,55 @@ static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
 // supaya rendering frame berikutnya tidak terganggu.
 
 static inline void set_uniform_color(const float col[4]) {
-    // Langsung set uniform tanpa cek g_we_overrode_color
-    // Dipanggil dari dalam two-pass, loc sudah pasti resolved (bukan -2)
     if (g_materialDiffuse_loc >= 0)
         orig_glUniform4fv(g_materialDiffuse_loc, 1, col);
     if (g_materialAmbient_loc >= 0)
         orig_glUniform4fv(g_materialAmbient_loc, 1, col);
 }
 
-static void two_pass_draw_elements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+static inline void apply_wallhack_state(void) {
     force_opaque_state();
-
-    // ── Pass 1: KUNING – ped di balik tembok ──────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-    orig_glDepthFunc(GL_GREATER);
-    orig_glDepthMask(GL_FALSE);
-    set_uniform_color(g_color_behind);
-    orig_glDrawElements(mode, count, type, indices);
-
-    // ── Pass 2: HIJAU – ped terlihat normal ───────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(0.0f, 0.0f);
+    // Render ped di atas semua geometry (wallhack)
     orig_glDepthFunc(GL_ALWAYS);
-    orig_glDepthMask(GL_TRUE);
+    orig_glDepthMask(GL_FALSE);
+    if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
     set_uniform_color(g_color);
-    orig_glDrawElements(mode, count, type, indices);
-
-    // ── Restore depth state game ──────────────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-    orig_glDepthFunc(g_game_depth_func);
-    orig_glDepthMask(g_game_depth_mask);
 }
 
-static void two_pass_draw_arrays(GLenum mode, GLint first, GLsizei count) {
-    force_opaque_state();
-
-    // ── Pass 1: KUNING ────────────────────────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-    orig_glDepthFunc(GL_GREATER);
-    orig_glDepthMask(GL_FALSE);
-    set_uniform_color(g_color_behind);
-    orig_glDrawArrays(mode, first, count);
-
-    // ── Pass 2: HIJAU ─────────────────────────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(0.0f, 0.0f);
-    orig_glDepthFunc(GL_ALWAYS);
-    orig_glDepthMask(GL_TRUE);
-    set_uniform_color(g_color);
-    orig_glDrawArrays(mode, first, count);
-
-    // ── Restore ───────────────────────────────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
+static inline void restore_after_draw(void) {
     orig_glDepthFunc(g_game_depth_func);
     orig_glDepthMask(g_game_depth_mask);
+    if (orig_glDepthRangef)
+        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
 }
 
 // ─── Hook: glDrawElements / glDrawArrays ─────────────────────────────────────
 static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    // v3.3: log SEMUA draw call
-    if (g_log_draw_count < 100) {
-        logff_("[SOLIDSKIN] DrawElements prog=%u is_ped=%d count=%d",
-               g_current_program, g_is_ped_program, count);
-        g_log_draw_count++;
-    }
     if (g_enabled && g_is_ped_program) {
-        if (g_depth_bypass) {
-            two_pass_draw_elements(mode, count, type, indices);
-        } else {
-            force_opaque_state();
-            set_uniform_color(g_color);
-            orig_glDrawElements(mode, count, type, indices);
-        }
+        apply_wallhack_state();
+        orig_glDrawElements(mode, count, type, indices);
+        restore_after_draw();
         return;
     }
     orig_glDrawElements(mode, count, type, indices);
 }
 
 static void hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    // v3.3: log SEMUA draw call (bukan hanya ped) untuk cari prog 149
-    if (g_log_draw_count < 100) {
-        logff_("[SOLIDSKIN] DrawArrays prog=%u is_ped=%d count=%d",
-               g_current_program, g_is_ped_program, count);
-        g_log_draw_count++;
-    }
     if (g_enabled && g_is_ped_program) {
-        if (g_depth_bypass) {
-            two_pass_draw_arrays(mode, first, count);
-        } else {
-            force_opaque_state();
-            set_uniform_color(g_color);
-            orig_glDrawArrays(mode, first, count);
-        }
+        apply_wallhack_state();
+        orig_glDrawArrays(mode, first, count);
+        restore_after_draw();
         return;
     }
     orig_glDrawArrays(mode, first, count);
 }
 
 // ─── Hook: glDrawArraysInstanced / glDrawElementsInstanced ──────────────────
-// GTA SA Mobile pakai instanced draw untuk ped LOD / ped jauh.
-// Sama persis logikanya dengan non-instanced, hanya forward ke instanced orig.
-
 static void hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     if (g_enabled && g_is_ped_program) {
-        if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawArraysInstanced two-pass prog=%u count=%d inst=%d",
-                   g_current_program, count, instancecount);
-            g_log_draw_count++;
-        }
-        if (g_depth_bypass) {
-            // Pass 1: KUNING - behind wall
-            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-            orig_glDepthFunc(GL_GREATER);
-            orig_glDepthMask(GL_FALSE);
-            set_uniform_color(g_color_behind);
-            orig_glDrawArraysInstanced(mode, first, count, instancecount);
-            // Pass 2: HIJAU - visible
-            if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
-            orig_glDepthFunc(GL_ALWAYS);
-            orig_glDepthMask(GL_TRUE);
-            set_uniform_color(g_color);
-            orig_glDrawArraysInstanced(mode, first, count, instancecount);
-            // Restore
-            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-            orig_glDepthFunc(g_game_depth_func);
-            orig_glDepthMask(g_game_depth_mask);
-        } else {
-            force_opaque_state();
-            set_uniform_color(g_color);
-            orig_glDrawArraysInstanced(mode, first, count, instancecount);
-        }
+        apply_wallhack_state();
+        orig_glDrawArraysInstanced(mode, first, count, instancecount);
+        restore_after_draw();
         return;
     }
     orig_glDrawArraysInstanced(mode, first, count, instancecount);
@@ -557,115 +427,32 @@ static void hook_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, 
 static void hook_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
                                           const void* indices, GLsizei instancecount) {
     if (g_enabled && g_is_ped_program) {
-        if (g_log_draw_count < 20) {
-            logff_("[SOLIDSKIN] DrawElementsInstanced two-pass prog=%u count=%d inst=%d",
-                   g_current_program, count, instancecount);
-            g_log_draw_count++;
-        }
-        if (g_depth_bypass) {
-            // Pass 1: KUNING
-            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-            orig_glDepthFunc(GL_GREATER);
-            orig_glDepthMask(GL_FALSE);
-            set_uniform_color(g_color_behind);
-            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
-            // Pass 2: HIJAU
-            if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
-            orig_glDepthFunc(GL_ALWAYS);
-            orig_glDepthMask(GL_TRUE);
-            set_uniform_color(g_color);
-            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
-            // Restore
-            if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-            orig_glDepthFunc(g_game_depth_func);
-            orig_glDepthMask(g_game_depth_mask);
-        } else {
-            force_opaque_state();
-            set_uniform_color(g_color);
-            orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
-        }
+        apply_wallhack_state();
+        orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
+        restore_after_draw();
         return;
     }
     orig_glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 
-// ─── Hook: eglGetProcAddress (DIAGNOSTIK v2.9) ──────────────────────────────
-// Game bisa load fungsi GL lewat eglGetProcAddress, bukan dlsym.
-// Kita intercept untuk tahu fungsi draw apa yang di-load, dan
-// replace pointer-nya kalau itu adalah draw call yang kita butuhkan.
-static const char* g_draw_keywords[] = {
-    "Draw", "draw", nullptr
-};
-
-// ─── Hook: kandidat draw tambahan (DIAGNOSTIK v2.8) ─────────────────────────
-// Tujuan: cari tahu fungsi draw MANA yang dipakai prog ped yang tidak
-// terdeksi oleh glDrawArrays/Elements/Instanced. Setiap fungsi log
-// prog+is_ped agar kita tahu persis mana yang terpanggil.
-
-static int g_diag_count = 0;
-
-#define DIAG_LOG(fname) \
-    if (g_is_ped_program && g_diag_count < 40) { \
-        logff_("[SOLIDSKIN] DIAG " fname " prog=%u is_ped=%d diffuse=%d", \
-               g_current_program, g_is_ped_program, g_materialDiffuse_loc); \
-        g_diag_count++; \
-    }
-
+// ─── Hook: kandidat draw tambahan ────────────────────────────────────────────
 static void hook_glDrawRangeElements(GLenum mode, GLuint start, GLuint end,
                                       GLsizei count, GLenum type, const void* indices) {
-    DIAG_LOG("glDrawRangeElements")
-    if (g_enabled && g_is_ped_program && g_depth_bypass) {
-        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-        orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
-        set_uniform_color(g_color_behind);
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
         orig_glDrawRangeElements(mode, start, end, count, type, indices);
-        if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
-        orig_glDepthFunc(GL_ALWAYS); orig_glDepthMask(GL_TRUE);
-        set_uniform_color(g_color);
-        orig_glDrawRangeElements(mode, start, end, count, type, indices);
-        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-        orig_glDepthFunc(g_game_depth_func); orig_glDepthMask(g_game_depth_mask);
+        restore_after_draw();
         return;
     }
     orig_glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
-static void hook_glMultiDrawArrays(GLenum mode, const GLint* first,
-                                    const GLsizei* count, GLsizei drawcount) {
-    DIAG_LOG("glMultiDrawArrays")
-    orig_glMultiDrawArrays(mode, first, count, drawcount);
-}
-
-static void hook_glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
-                                      const void* const* indices, GLsizei drawcount) {
-    DIAG_LOG("glMultiDrawElements")
-    orig_glMultiDrawElements(mode, count, type, indices, drawcount);
-}
-
-static void hook_glDrawArraysIndirect(GLenum mode, const void* indirect) {
-    DIAG_LOG("glDrawArraysIndirect")
-    orig_glDrawArraysIndirect(mode, indirect);
-}
-
-static void hook_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
-    DIAG_LOG("glDrawElementsIndirect")
-    orig_glDrawElementsIndirect(mode, type, indirect);
-}
-
 static void hook_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
                                            const void* indices, GLint basevertex) {
-    DIAG_LOG("glDrawElementsBaseVertex")
-    if (g_enabled && g_is_ped_program && g_depth_bypass) {
-        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-        orig_glDepthFunc(GL_GREATER); orig_glDepthMask(GL_FALSE);
-        set_uniform_color(g_color_behind);
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
         orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
-        if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
-        orig_glDepthFunc(GL_ALWAYS); orig_glDepthMask(GL_TRUE);
-        set_uniform_color(g_color);
-        orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
-        if (orig_glDepthRangef) orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-        orig_glDepthFunc(g_game_depth_func); orig_glDepthMask(g_game_depth_mask);
+        restore_after_draw();
         return;
     }
     orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
@@ -707,182 +494,6 @@ static void apply_egl_draw_hooks(void* dobbyHook_fn) {
 
 // Simpan dobbyHook ptr untuk dipakai di apply_egl_draw_hooks
 static void* g_dobbyHook_fn = nullptr;
-
-// ─── RenderWare skin render callback hook ────────────────────────────────────
-// Dipanggil oleh RenderWare untuk setiap draw ped via internal pipeline.
-// Kita intercept di sini untuk two-pass tanpa perlu hook glDrawArrays.
-
-static void rw_skin_render_cb(void* resEntry, void* object,
-                               uint8_t type, uint32_t flags) {
-    RwRenderCB_t orig = g_orig_skin_render_cb[0];
-    if (!orig || !g_enabled || !g_depth_bypass) {
-        if (orig) orig(resEntry, object, type, flags);
-        return;
-    }
-
-    // Gunakan loc yang sudah di-cache dari hook_glUseProgram
-    // JANGAN panggil glGetUniformLocation di sini (crash RW resource)
-    // g_materialDiffuse_loc sudah valid karena glUseProgram dipanggil sebelum CB ini
-    GLint d_loc = g_materialDiffuse_loc;
-    GLint a_loc = g_materialAmbient_loc;
-
-    auto set_color_rw = [&](const float col[4]) {
-        if (d_loc >= 0) orig_glUniform4fv(d_loc, 1, col);
-        if (a_loc >= 0) orig_glUniform4fv(a_loc, 1, col);
-    };
-
-    force_opaque_state();
-
-    // ── Pass 1: KUNING – di balik tembok ─────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-    orig_glDepthFunc(GL_GREATER);
-    orig_glDepthMask(GL_FALSE);
-    g_in_rw_render = 1;
-    g_rw_pass      = 1;
-    set_color_rw(g_color_behind);
-    orig(resEntry, object, type, flags);
-    set_color_rw(g_color_behind);
-
-    // ── Pass 2: HIJAU – terlihat normal ──────────────────────────────────
-    if (orig_glDepthRangef) orig_glDepthRangef(0.0f, 0.0f);
-    orig_glDepthFunc(GL_ALWAYS);
-    orig_glDepthMask(GL_TRUE);
-    g_rw_pass = 2;
-    set_color_rw(g_color);
-    orig(resEntry, object, type, flags);
-
-    g_in_rw_render = 0;
-    g_rw_pass      = 0;
-
-    // ── Restore ───────────────────────────────────────────────────────────
-    if (orig_glDepthRangef)
-        orig_glDepthRangef(g_game_depth_range_near, g_game_depth_range_far);
-    orig_glDepthFunc(g_game_depth_func);
-    orig_glDepthMask(g_game_depth_mask);
-    set_color_rw(g_color);
-}
-
-// Akses RxPipelineNode dari RxPipeline* dan install render CB kita.
-// Dari analisa disassembly:
-//   pipeline + 0x18 → nodes_container*
-//   nodes_container + 0x58 → RxPipelineNode*
-//   RxOpenGLAllInOneSetRenderCallBack(node, cb) → node+0x10 = cb
-static void install_rw_render_cb_for_skin(int skinType) {
-    if (!fn_RpSkinGetOpenGLPipeline || !fn_RxOpenGLAllInOneSetRenderCallBack ||
-        !fn_RxOpenGLAllInOneGetRenderCallBack) return;
-
-    void* pipeline = fn_RpSkinGetOpenGLPipeline(skinType);
-    if (!pipeline) {
-        logff_("[SOLIDSKIN] RW: pipeline skinType=%d = NULL", skinType);
-        return;
-    }
-
-    // nodes_container = pipeline + 0x18
-    void* nodes_container = *(void**)((uint8_t*)pipeline + 0x18);
-    if (!nodes_container) {
-        logff_("[SOLIDSKIN] RW: nodes_container NULL skinType=%d", skinType);
-        return;
-    }
-
-    // node = nodes_container + 0x58
-    void* node = *(void**)((uint8_t*)nodes_container + 0x58);
-    if (!node) {
-        logff_("[SOLIDSKIN] RW: node NULL skinType=%d", skinType);
-        return;
-    }
-
-    // Simpan orig CB
-    RwRenderCB_t orig = fn_RxOpenGLAllInOneGetRenderCallBack(node);
-    if (orig == rw_skin_render_cb) {
-        logff_("[SOLIDSKIN] RW: skinType=%d sudah ter-hook, skip", skinType);
-        return;
-    }
-
-    if (skinType < 4) g_orig_skin_render_cb[skinType] = orig;
-    // Pakai index 0 sebagai shared orig (semua skin type pakai CB yang sama)
-    if (!g_orig_skin_render_cb[0] && orig) g_orig_skin_render_cb[0] = orig;
-
-    fn_RxOpenGLAllInOneSetRenderCallBack(node, rw_skin_render_cb);
-    logff_("[SOLIDSKIN] RW: hook skinType=%d node=%p orig=%p OK",
-           skinType, node, (void*)orig);
-}
-
-static void install_rw_hooks(void) {
-    if (g_rw_hook_installed) return;
-    if (!fn_RpSkinGetOpenGLPipeline) return;
-
-    logf_("[SOLIDSKIN] RW: install render CB hooks...");
-    int installed = 0;
-
-    // Dari analisa runtime:
-    //   pipeline+0x14 → nodedata ptr  (bukan +0x18 seperti asumsi awal)
-    //   nodedata+0x38 → renderCB      (bukan +0x10)
-    // skinType 0=standard, 1=matfx, 2=env, 3=combinedmatfx
-    // skinType 0 mengembalikan 0x1 (invalid), skip
-    // skinType 1 & 2 valid, skinType 3 = NULL
-
-    for (int i = 0; i < 4; i++) {
-        void* pipeline = fn_RpSkinGetOpenGLPipeline(i);
-        uintptr_t pip_addr = (uintptr_t)pipeline;
-
-        // Skip invalid: NULL, 0x1 (Thumb bit artifact), atau sangat kecil
-        if (pip_addr <= 0x10) {
-            logff_("[SOLIDSKIN] RW: skinType=%d pipeline=0x%X skip", i, (unsigned)pip_addr);
-            continue;
-        }
-
-        // nodedata = *(pipeline + 0x14)
-        void* nodedata = *(void**)((uint8_t*)pipeline + 0x14);
-        if (!nodedata) {
-            logff_("[SOLIDSKIN] RW: skinType=%d nodedata NULL", i);
-            continue;
-        }
-
-        // renderCB = *(nodedata + 0x38)
-        RwRenderCB_t* cb_slot = (RwRenderCB_t*)((uint8_t*)nodedata + 0x38);
-        RwRenderCB_t orig = *cb_slot;
-
-        logff_("[SOLIDSKIN] RW: skinType=%d pipeline=0x%X nodedata=0x%X renderCB=0x%X",
-               i, (unsigned)pip_addr, (unsigned)(uintptr_t)nodedata, (unsigned)(uintptr_t)orig);
-
-        if (orig == rw_skin_render_cb) {
-            logff_("[SOLIDSKIN] RW: skinType=%d sudah ter-hook", i);
-            installed++;
-            continue;
-        }
-
-        // Simpan orig (pakai index 0 sebagai shared)
-        if (i < 4) g_orig_skin_render_cb[i] = orig;
-        if (!g_orig_skin_render_cb[0] && orig) g_orig_skin_render_cb[0] = orig;
-
-        // Patch langsung ke slot (tidak perlu RxOpenGLAllInOneSetRenderCallBack)
-        *cb_slot = rw_skin_render_cb;
-        logff_("[SOLIDSKIN] RW: skinType=%d hook OK orig=0x%X",
-               i, (unsigned)(uintptr_t)orig);
-        installed++;
-    }
-
-    if (installed > 0) {
-        g_rw_hook_installed = 1;
-        logff_("[SOLIDSKIN] RW: %d hooks installed", installed);
-    } else {
-        logf_("[SOLIDSKIN] RW: semua pipeline invalid, akan retry nanti");
-    }
-}
-
-// Hook _rpCreatePlatformAtomicPipelines — dipanggil saat pipeline ped dibuat.
-// Setelah fungsi ini selesai, kita install render CB kita.
-typedef int (*rpCreatePlatformAtomicPipelines_t)(void);
-static rpCreatePlatformAtomicPipelines_t orig_rpCreatePlatformAtomicPipelines = nullptr;
-
-static int hook_rpCreatePlatformAtomicPipelines(void) {
-    int result = orig_rpCreatePlatformAtomicPipelines();
-    logff_("[SOLIDSKIN] _rpCreatePlatformAtomicPipelines ret=%d", result);
-    // Tidak install di sini — pipeline belum ter-isi saat fungsi ini return.
-    // Install akan dilakukan dari hook_glUseProgram secara lazy.
-    return result;
-}
 
 static __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char* procname) {
     auto result = orig_eglGetProcAddress(procname);
@@ -939,23 +550,13 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
     }
 
     // Intercept warna diffuse/ambient -> set ke warna HIJAU (g_color)
-    // Warna KUNING untuk behind-wall diterapkan langsung di draw call pass 1.
     if (location != -1 && location == g_materialDiffuse_loc) {
-        // Saat RW render CB aktif, pilih warna sesuai pass
-        const float* col = g_color;
-        if (g_in_rw_render) {
-            col = (g_rw_pass == 1) ? g_color_behind : g_color;
-        }
-        orig_glUniform4fv(location, count, col);
+        orig_glUniform4fv(location, count, g_color);
         g_we_overrode_color = 1;
         return;
     }
     if (location != -1 && location == g_materialAmbient_loc) {
-        const float* col = g_color;
-        if (g_in_rw_render) {
-            col = (g_rw_pass == 1) ? g_color_behind : g_color;
-        }
-        orig_glUniform4fv(location, count, col);
+        orig_glUniform4fv(location, count, g_color);
         g_we_overrode_color = 1;
         return;
     }
@@ -999,13 +600,13 @@ EXPORT SolidSkinAPI solidskin_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "solidskin|3.10|fix crash RW CB pakai cached loc|brruham";
+        "solidskin|4.0|wallhack hijau solid stable|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[SOLIDSKIN] OnModPreLoad v3.10 (fix crash: no glGetUniformLocation in RW CB)");
+    logf_("[SOLIDSKIN] OnModPreLoad v4.0stable (hijau solid, tanpa two-pass/RW)");
 
     g_enabled                   = 0;
     g_current_program           = 0;
@@ -1016,9 +617,6 @@ EXPORT void OnModPreLoad() {
     g_blend_currently_on        = 0;
     g_we_overrode_color         = 0;
     g_log_draw_count            = 0;
-    g_diag_count                = 0;
-    g_trace_active              = 0;
-    g_trace_log_count           = 0;
     g_egl_hooks_applied         = false;
     g_log_bind_count            = 0;
     g_block_blend               = 1;
@@ -1035,15 +633,12 @@ EXPORT void OnModPreLoad() {
     g_game_depth_range_far      = 1.0f;
     g_program_cache.clear();
 
-    // Visible = HIJAU
+    // Warna default: hijau
     g_color[0] = 0.0f; g_color[1] = 1.0f; g_color[2] = 0.0f; g_color[3] = 1.0f;
-    // Behind wall = KUNING
-    g_color_behind[0] = 1.0f; g_color_behind[1] = 1.0f;
-    g_color_behind[2] = 0.0f; g_color_behind[3] = 1.0f;
 }
 
 EXPORT void OnModLoad() {
-    logf_("[SOLIDSKIN] OnModLoad v3.10 mulai");
+    logf_("[SOLIDSKIN] OnModLoad v4.0stable mulai");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[SOLIDSKIN] ERROR: libdobby.so tidak ditemukan"); return; }
@@ -1174,48 +769,11 @@ EXPORT void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/solidskin_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&solidskin_api); fclose(af); }
 
-    // ── Hook RenderWare pipeline (untuk ped yang tidak lewat glDrawArrays) ─
-    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!hGTASA) hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_GLOBAL);
-    if (hGTASA) {
-        fn_RpSkinGetOpenGLPipeline = (RpSkinGetOpenGLPipeline_t)
-            dlsym(hGTASA, "RpSkinGetOpenGLPipeline");
-        fn_RxOpenGLAllInOneSetRenderCallBack = (RxOpenGLAllInOneSetRenderCallBack_t)
-            dlsym(hGTASA, "_Z33RxOpenGLAllInOneSetRenderCallBackP14RxPipelineNodePFvP10RwResEntryPvhjE");
-        fn_RxOpenGLAllInOneGetRenderCallBack = (RxOpenGLAllInOneGetRenderCallBack_t)
-            dlsym(hGTASA, "_Z33RxOpenGLAllInOneGetRenderCallBackP14RxPipelineNode");
-
-        logff_("[SOLIDSKIN] RpSkinGetOpenGLPipeline = %p", (void*)fn_RpSkinGetOpenGLPipeline);
-        logff_("[SOLIDSKIN] SetRenderCallBack = %p", (void*)fn_RxOpenGLAllInOneSetRenderCallBack);
-        logff_("[SOLIDSKIN] GetRenderCallBack = %p", (void*)fn_RxOpenGLAllInOneGetRenderCallBack);
-
-        // Hook _rpCreatePlatformAtomicPipelines agar kita tahu kapan pipeline siap
-        auto rpCreate = (rpCreatePlatformAtomicPipelines_t)
-            dlsym(hGTASA, "_Z32_rpCreatePlatformAtomicPipelinesv");
-        if (rpCreate) {
-            if (dobbyHook((void*)rpCreate,
-                          (void*)hook_rpCreatePlatformAtomicPipelines,
-                          (void**)&orig_rpCreatePlatformAtomicPipelines) == 0) {
-                logf_("[SOLIDSKIN] hook _rpCreatePlatformAtomicPipelines OK");
-            } else {
-                logf_("[SOLIDSKIN] WARNING: hook _rpCreatePlatformAtomicPipelines gagal");
-            }
-        } else {
-            logf_("[SOLIDSKIN] WARNING: _rpCreatePlatformAtomicPipelines tidak ditemukan");
-        }
-
-        // Coba install sekarang juga kalau pipeline sudah ada
-        install_rw_hooks();
-    } else {
-        logf_("[SOLIDSKIN] WARNING: libGTASA.so tidak bisa di-dlopen");
-    }
-
-    // Coba apply EGL draw hooks sekarang juga (bukan nunggu game panggil eglGetProcAddress)
+    // Coba apply EGL draw hooks
     apply_egl_draw_hooks((void*)dobbyHook);
 
     g_enabled = 1;
-    logf_("[SOLIDSKIN] OnModLoad SELESAI v3.10 - auto enabled");
-    logf_("[SOLIDSKIN] v3.10: RW CB pakai cached g_materialDiffuse_loc, no glGetUniformLocation");
+    logf_("[SOLIDSKIN] OnModLoad SELESAI v4.0stable - hijau solid");
 }
 
 } // extern "C"
