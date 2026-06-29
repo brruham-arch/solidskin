@@ -458,6 +458,52 @@ static void hook_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum typ
     orig_glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
 }
 
+static void hook_glDrawArraysIndirect(GLenum mode, const void* indirect) {
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
+        orig_glDrawArraysIndirect(mode, indirect);
+        restore_after_draw();
+        return;
+    }
+    orig_glDrawArraysIndirect(mode, indirect);
+}
+
+static void hook_glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
+        orig_glDrawElementsIndirect(mode, type, indirect);
+        restore_after_draw();
+        return;
+    }
+    orig_glDrawElementsIndirect(mode, type, indirect);
+}
+
+static void hook_glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
+        orig_glMultiDrawArrays(mode, first, count, drawcount);
+        restore_after_draw();
+        return;
+    }
+    orig_glMultiDrawArrays(mode, first, count, drawcount);
+}
+
+static void hook_glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
+                                      const void* const* indices, GLsizei drawcount) {
+    if (g_enabled && g_is_ped_program) {
+        apply_wallhack_state();
+        orig_glMultiDrawElements(mode, count, type, indices, drawcount);
+        restore_after_draw();
+        return;
+    }
+    orig_glMultiDrawElements(mode, count, type, indices, drawcount);
+}
+
+// Keywords dipakai utk filter procname di hook_eglGetProcAddress (lihat di bawah)
+static const char* g_draw_keywords[] = {
+    "glDraw", "glMultiDraw", nullptr
+};
+
 // Hook draw func via pointer yg dikembalikan eglGetProcAddress.
 // Game bisa saja pakai pointer ini secara langsung (disimpan di vtable/global),
 // sehingga hook kita di libGLESv2/v3 tidak kena. Kita hook pointer EGL-nya.
