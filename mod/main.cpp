@@ -60,6 +60,8 @@ static std::unordered_map<GLuint, ProgramInfo> g_program_cache;
 typedef void  (*glUniform4fv_t)(GLint, GLsizei, const GLfloat*);
 typedef void  (*glUseProgram_t)(GLuint);
 typedef GLint (*glGetUniformLocation_t)(GLuint, const char*);
+typedef void  (*glGetProgramiv_t)(GLuint, GLenum, GLint*);
+typedef void  (*glGetActiveUniform_t)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, GLchar*);
 typedef void  (*glEnable_t)(GLenum);
 typedef void  (*glDisable_t)(GLenum);
 typedef void  (*glBlendFunc_t)(GLenum, GLenum);
@@ -87,6 +89,8 @@ typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_t)(const ch
 static glUniform4fv_t         orig_glUniform4fv         = nullptr;
 static glUseProgram_t         orig_glUseProgram         = nullptr;
 static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
+static glGetProgramiv_t       orig_glGetProgramiv       = nullptr;
+static glGetActiveUniform_t   orig_glGetActiveUniform   = nullptr;
 static glEnable_t             orig_glEnable             = nullptr;
 static glDisable_t            orig_glDisable            = nullptr;
 static glBlendFunc_t          orig_glBlendFunc          = nullptr;
@@ -327,6 +331,7 @@ static void hook_glUseProgram(GLuint program) {
 
                 logff_("[SOLIDSKIN] resolve(UseProgram) prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
                        program, d, a, b, is_ped);
+                if (is_ped) dump_program_uniforms(program);
             }
         }
 
@@ -368,6 +373,21 @@ static void hook_glBlendFunc(GLenum sfactor, GLenum dfactor) {
 //
 // Setelah dua pass selesai, depth state dikembalikan ke nilai game asli
 // supaya rendering frame berikutnya tidak terganggu.
+
+// ─── Debug: dump semua active uniform di sebuah program (sekali per program) ──
+static void dump_program_uniforms(GLuint program) {
+    if (!orig_glGetProgramiv || !orig_glGetActiveUniform) return;
+    GLint count = 0;
+    orig_glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
+    logff_("[SOLIDSKIN] === dump uniforms prog=%u count=%d ===", program, count);
+    char name[256];
+    for (GLint i = 0; i < count; i++) {
+        GLsizei len = 0; GLint size = 0; GLenum type = 0;
+        orig_glGetActiveUniform(program, (GLuint)i, sizeof(name), &len, &size, &type, name);
+        GLint loc = orig_glGetUniformLocation(program, name);
+        logff_("[SOLIDSKIN]   uniform[%d] name=%s type=0x%x size=%d loc=%d", i, name, type, size, loc);
+    }
+}
 
 static inline void set_uniform_color(const float col[4]) {
     if (g_materialDiffuse_loc >= 0)
@@ -589,6 +609,7 @@ static void hook_glUniform4fv(GLint location, GLsizei count, const GLfloat* valu
 
         logff_("[SOLIDSKIN] resolve prog=%u diffuse=%d ambient=%d bones=%d is_ped=%d",
                g_current_program, d, a, b, is_ped);
+        if (is_ped) dump_program_uniforms(g_current_program);
 
         if (g_enabled && g_block_blend && g_is_ped_program)
             force_opaque_state();
@@ -703,6 +724,11 @@ EXPORT void OnModLoad() {
     orig_glGetUniformLocation = (glGetUniformLocation_t)dlsym(hGLES2, "glGetUniformLocation");
     if (!orig_glGetUniformLocation) { logf_("[SOLIDSKIN] ERROR: glGetUniformLocation null"); return; }
     logf_("[SOLIDSKIN] glGetUniformLocation OK");
+
+    orig_glGetProgramiv = (glGetProgramiv_t)dlsym(hGLES2, "glGetProgramiv");
+    orig_glGetActiveUniform = (glGetActiveUniform_t)dlsym(hGLES2, "glGetActiveUniform");
+    logf_("[SOLIDSKIN] glGetProgramiv=%p glGetActiveUniform=%p",
+          (void*)orig_glGetProgramiv, (void*)orig_glGetActiveUniform);
 
     orig_glGetError = (glGetError_t)dlsym(hGLES2, "glGetError");
 
