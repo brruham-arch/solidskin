@@ -91,6 +91,10 @@ static glUseProgram_t         orig_glUseProgram         = nullptr;
 static glGetUniformLocation_t orig_glGetUniformLocation = nullptr;
 static glGetProgramiv_t       orig_glGetProgramiv       = nullptr;
 static glGetActiveUniform_t   orig_glGetActiveUniform   = nullptr;
+
+// Forward declaration (definisi lengkap ada di bawah, dipanggil dari hook_glUseProgram)
+static void dump_program_uniforms(GLuint program);
+
 static glEnable_t             orig_glEnable             = nullptr;
 static glDisable_t            orig_glDisable            = nullptr;
 static glBlendFunc_t          orig_glBlendFunc          = nullptr;
@@ -727,7 +731,7 @@ EXPORT void OnModLoad() {
 
     orig_glGetProgramiv = (glGetProgramiv_t)dlsym(hGLES2, "glGetProgramiv");
     orig_glGetActiveUniform = (glGetActiveUniform_t)dlsym(hGLES2, "glGetActiveUniform");
-    logf_("[SOLIDSKIN] glGetProgramiv=%p glGetActiveUniform=%p",
+    logff_("[SOLIDSKIN] glGetProgramiv=%p glGetActiveUniform=%p",
           (void*)orig_glGetProgramiv, (void*)orig_glGetActiveUniform);
 
     orig_glGetError = (glGetError_t)dlsym(hGLES2, "glGetError");
